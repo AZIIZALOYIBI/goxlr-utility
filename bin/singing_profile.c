@@ -37,19 +37,16 @@ static const char PROFILE_DATA[] =
     " MIC_GATE_MACRO_AMOUNT=\"0\" MIC_GATE_THRESOLD=\"-52\""
     " MIC_GATE_ATTACK=\"1\" MIC_GATE_RELEASE=\"35\""
     " MIC_GATE_ENABLE=\"1\" MIC_GATE_ATTEN=\"100\""
-    " MIC_COMP_SELECT=\"1\" BLEEP_LEVEL=\"-10\" MIC_GATE_MODE=\"2\"/>
-    "
-    "  <setupTreeMicProfile MIC_TYPE=\"0\""
-    " DYNAMIC_MIC_GAIN=\"1966080\""
-    " CONDENSER_MIC_GAIN=\"1966080\""
-    " TRS_MIC_GAIN=\"1966080\"/>
-    "
-    "  <micProfileUIMicProfile eqAdvanced=\"0\" compAdvanced=\"0\""
-    " gateAdvanced=\"0\" eqFineTuneEnabled=\"0\"/>
-    "
+    " MIC_COMP_SELECT=\"1\" BLEEP_LEVEL=\"-10\" MIC_GATE_MODE=\"2\"/>\n"
+    "  <setupTreeMicProfile MIC_TYPE=\"0\"\n"
+    " DYNAMIC_MIC_GAIN=\"1966080\"\n"
+    " CONDENSER_MIC_GAIN=\"1966080\"\n"
+    " TRS_MIC_GAIN=\"1966080\"/>\n"
+    "  <micProfileUIMicProfile eqAdvanced=\"0\" compAdvanced=\"0\"\n"
+    " gateAdvanced=\"0\" eqFineTuneEnabled=\"0\"/>\n"
     "</MicProfileTree>\n";
 
-static const char *PROFILE_NAME = \"SINGING.goxlrMicProfile\";
+static const char *PROFILE_NAME = "SINGING.goxlrMicProfile";
 
 void create_dir(const char *path) {
     char tmp[512];
