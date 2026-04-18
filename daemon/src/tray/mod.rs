@@ -1,5 +1,5 @@
-use crate::events::EventTriggers;
 use crate::DaemonState;
+use crate::events::EventTriggers;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -15,7 +15,13 @@ mod windows;
 pub fn handle_tray(state: DaemonState, tx: mpsc::Sender<EventTriggers>) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        linux::handle_tray(state, tx)
+        use std::sync::atomic::Ordering;
+        use tokio::task;
+        if state.show_tray.load(Ordering::Relaxed) {
+            // We'll just spawn the tray and return.
+            task::spawn(linux::handle_tray(state.shutdown, tx));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -33,17 +39,4 @@ pub fn handle_tray(state: DaemonState, tx: mpsc::Sender<EventTriggers>) -> Resul
         // For now, don't spawn a tray icon.
         Ok(())
     }
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::ICON;
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn get_icon_from_global() -> (Vec<u8>, u32, u32) {
-    let image = image::load_from_memory(ICON)
-        .expect("Failed to load Icon")
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    let rgba = image.into_raw();
-    (rgba, width, height)
 }

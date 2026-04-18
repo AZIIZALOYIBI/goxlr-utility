@@ -3,28 +3,33 @@
 extern crate core;
 
 use std::fs::create_dir_all;
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use actix_web::dev::ServerHandle;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use enum_map::EnumMap;
 use file_rotate::compression::Compression;
 use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
 use json_patch::Patch;
+use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use simplelog::{
     ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
 };
-use tokio::join;
-use tokio::sync::{broadcast, mpsc};
+use sys_locale::get_locale;
 
-use goxlr_ipc::{HttpSettings, LogLevel};
+use tokio::join;
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use goxlr_ipc::{FirmwareSource, HttpSettings, LogLevel};
 
 use crate::cli::{Cli, LevelFilter};
-use crate::events::{spawn_event_handler, DaemonState, EventTriggers};
-use crate::files::{spawn_file_notification_service, FileManager};
+use crate::events::{DaemonState, EventTriggers, spawn_event_handler};
+use crate::files::{FileManager, spawn_file_notification_service};
 use crate::platform::perform_preflight;
 use crate::platform::spawn_runtime;
 use crate::primary_worker::spawn_usb_handler;
@@ -39,6 +44,7 @@ mod cli;
 mod device;
 mod events;
 mod files;
+mod firmware;
 mod mic_profile;
 mod platform;
 mod primary_worker;
@@ -50,7 +56,16 @@ mod tray;
 mod tts;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[allow(dead_code)]
 const ICON: &[u8] = include_bytes!("../resources/goxlr-utility-large.png");
+#[cfg(target_os = "macos")]
+const ICON_MAC: &[u8] = include_bytes!("../resources/icon.icns");
+
+const FIRMWARE_PATHS: EnumMap<FirmwareSource, &str> = EnumMap::from_array([
+    "https://utility.frostycoolslug.com/update-site/stable/",
+    "https://utility.frostycoolslug.com/update-site/beta/",
+]);
 
 /**
 This is ugly, and I know it's ugly. I need to rework how the Primary Worker is constructed
@@ -60,6 +75,22 @@ rather than through additional parameters. When that comes, this will be removed
 static OVERRIDE_SAMPLER_INPUT: Mutex<Option<String>> = Mutex::new(None);
 static OVERRIDE_SAMPLER_OUTPUT: Mutex<Option<String>> = Mutex::new(None);
 
+/**
+This is also ugly, but for now it's important to allow users to simply disable aggregate
+management, and have the utility obey.
+*/
+pub static HANDLE_MACOS_AGGREGATES: Mutex<Option<bool>> = Mutex::new(Some(true));
+
+lazy_static! {
+    /**
+    This is a fetcher of the system locale, used for language and translations of the UI.
+    the sys-locale package should give us valid readings on Linux, MacOS and Windows
+     */
+    static ref SYSTEM_LOCALE: String = get_locale()
+        .unwrap_or_else(|| String::from("en_GB"))
+        .replace('-', "_");
+}
+
 // This is for global 'JSON Patches', for when something changes.
 #[derive(Debug, Clone)]
 pub struct PatchEvent {
@@ -68,17 +99,45 @@ pub struct PatchEvent {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Cli = Cli::parse();
+    // If running the utility has an error, make sure log level is debug, and propagate the
+    // error up to the user on Windows.
+    if let Err(e) = run_utility().await {
+        let args: Cli = Cli::parse();
+        let settings = SettingsHandle::load(args.config).await?;
 
-    // Before we do absolutely anything, we need to load the config file, as it implies log settings
+        if settings.get_log_level().await != LogLevel::Debug {
+            info!("Setting Log Level to Debug for next run..");
+            settings.set_log_level(LogLevel::Debug).await;
+            settings.save().await;
+        }
+
+        // Message is Cross-Platform now :)
+        let message = format!("Error Starting the GoXLR Utility:\r\n\r\n{e}");
+        platform::display_error(message);
+
+        // Kill the process with an error to ensure the entire runtime is stopped
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_utility() -> Result<()> {
+    // We're just going to re-parse the args here, while we've technically done it above,
+    // they get moved into the settings loader, which just causes headaches :D
+    let args: Cli = Cli::parse();
     let settings = SettingsHandle::load(args.config).await?;
+
+    // Set the MacOS Aggregate management..
+    let aggregates = settings.get_macos_handle_aggregates().await;
+    HANDLE_MACOS_AGGREGATES.lock().unwrap().replace(aggregates);
 
     // Configure and / or create the log path, and file name.
     let log_path = settings.get_log_directory().await;
-    if !log_path.clone().exists() {
-        if let Err(e) = create_dir_all(log_path.clone()) {
-            bail!("Unable to create log directory: {}", e);
-        }
+    if !log_path.clone().exists()
+        && let Err(e) = create_dir_all(log_path.clone())
+    {
+        bail!("Unable to create log directory: {}", e);
     }
     let log_file = log_path.join("goxlr-daemon.log");
 
@@ -93,10 +152,15 @@ async fn main() -> Result<()> {
     config.add_filter_ignore_str("actix_server::worker");
     config.add_filter_ignore_str("actix_server::server");
     config.add_filter_ignore_str("actix_server::builder");
+    config.add_filter_ignore_str("zbus");
+    config.add_filter_ignore_str("hyper_util");
+    config.add_filter_ignore_str("reqwest");
 
     // I'm generally not interested in the Symphonia header announcements which go to INFO,
     // it's only useful in a development setting!
     config.add_filter_ignore_str("symphonia");
+
+    let timezone_calculated = config.set_time_offset_to_local().is_ok();
 
     // Create a file rotator, that will compress and rotate files after 5Mb
     let file_rotator = FileRotate::new(
@@ -104,7 +168,6 @@ async fn main() -> Result<()> {
         AppendCount::new(5),
         ContentLimit::Bytes(1024 * 1024 * 2),
         Compression::OnRotate(1),
-        #[cfg(unix)]
         None,
     );
 
@@ -141,6 +204,19 @@ async fn main() -> Result<()> {
     ])
     .context("Could not configure the logger")?;
 
+    // Enable the PANIC logger..
+    log_panics::init();
+
+    if !timezone_calculated {
+        warn!("Unable to calculate timezone, using UTC for log timestamps");
+    }
+
+    if cfg!(target_os = "macos") {
+        debug!(
+            "Configure MacOS Aggregates: {:?}",
+            HANDLE_MACOS_AGGREGATES.lock().unwrap().unwrap()
+        );
+    }
     if is_root() {
         if args.force_root {
             error!("GoXLR Utility running as root, this is generally considered bad.");
@@ -150,8 +226,8 @@ async fn main() -> Result<()> {
             error!("please consult the 'Permissions' section of the README. Running as root");
             error!("*WILL* cause issues with the sampler, and may pose a security risk.");
             error!("");
-            #[cfg(target_family = "macos")]
-            {
+
+            if cfg!(target_os = "macos") {
                 error!("As a MacOS user, you may be attempting to run as root to solve the");
                 error!("issues of initialisation. The correct approach to this is to run the");
                 error!("goxlr-initialiser binary via sudo whenever a GoXLR device is attached.");
@@ -173,19 +249,21 @@ async fn main() -> Result<()> {
     }
 
     info!("Starting GoXLR Daemon v{}", VERSION);
+    info!("System Locale: {}", *SYSTEM_LOCALE);
 
     // Before we do anything, perform platform pre-flight to make
     // sure we're allowed to start.
     info!("Performing Platform Preflight...");
     perform_preflight()?;
 
-    let mut bind_address = String::from("localhost");
-    if let Some(address) = args.http_bind_address {
+    let bind_address = if let Some(address) = args.http_bind_address {
         debug!("Command Line Override, binding to: {}", address);
-        bind_address = address;
+        address
     } else if settings.get_allow_network_access().await {
-        bind_address = String::from("0.0.0.0");
-    }
+        String::from("0.0.0.0")
+    } else {
+        String::from("localhost")
+    };
 
     debug!("HTTP Bind Address: {}", bind_address);
     let http_settings = HttpSettings {
@@ -212,7 +290,7 @@ async fn main() -> Result<()> {
     let (httpd_tx, httpd_rx) = tokio::sync::oneshot::channel();
 
     // Create the Device shutdown signallers..
-    let (device_stop_tx, device_stop_rx) = mpsc::channel(1);
+    let (device_state_tx, device_state_rx) = mpsc::channel(1);
 
     // Create the Shutdown Signallers..
     let shutdown = Shutdown::new();
@@ -237,26 +315,32 @@ async fn main() -> Result<()> {
 
     // Spawn the IPC Socket..
     let ipc_socket = bind_socket().await;
-    if ipc_socket.is_err() {
-        error!("Error Starting Daemon: ");
-        bail!("{}", ipc_socket.err().unwrap());
+    if let Err(e) = ipc_socket {
+        error!("Error Binding IPC Socket: {}", e);
+        bail!("{}", e);
     }
+
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     // Start the USB Device Handler
     let usb_handle = tokio::spawn(spawn_usb_handler(
         usb_rx,
         file_rx,
-        device_stop_rx,
+        device_state_rx,
         broadcast_tx.clone(),
         global_tx.clone(),
+        ready_tx,
         shutdown.clone(),
         settings.clone(),
         http_settings.clone(),
         file_manager,
     ));
 
+    // Wait until the handler is setup
+    let _ = ready_rx.await;
+
     // Launch the IPC Server..
-    let ipc_socket = ipc_socket.unwrap();
+    let ipc_socket = ipc_socket?;
     let communications_handle = tokio::spawn(spawn_ipc_server(
         ipc_socket,
         usb_tx.clone(),
@@ -264,7 +348,7 @@ async fn main() -> Result<()> {
     ));
 
     // Run the HTTP Server (if enabled)..
-    let mut http_server: Option<ServerHandle> = None;
+    let mut http_server: Result<Option<ServerHandle>> = Ok(None);
     if http_settings.enabled {
         // Spawn a oneshot channel for managing the HTTP Server
         if http_settings.cors_enabled {
@@ -278,7 +362,14 @@ async fn main() -> Result<()> {
             http_settings.clone(),
             file_paths.clone(),
         ));
-        http_server = Some(httpd_rx.await?);
+        http_server = httpd_rx.await?;
+        if let Err(e) = http_server {
+            // Force a shutdown, if we bail! here, the entire async runtime will keep on going
+            // despite the server being pretty much dead, and threads may still be active causing
+            // us to go zombie.
+            shutdown.trigger();
+            bail!("Unable to Start HTTP Server: {}", e);
+        }
     } else {
         warn!("HTTP Server Disabled");
     }
@@ -306,14 +397,13 @@ async fn main() -> Result<()> {
     let event_handle = tokio::spawn(spawn_event_handler(
         state.clone(),
         global_rx,
-        device_stop_tx,
+        device_state_tx,
     ));
 
     // Spawn the Platform Runtime (if needed)
     let platform_handle = tokio::spawn(spawn_runtime(state.clone(), global_tx.clone()));
 
-    if args.start_ui {
-        //thread::sleep(Duration::from_millis(250));
+    if args.start_ui || settings.get_open_ui_on_launch().await {
         let _ = global_tx.send(EventTriggers::Activate).await;
     }
 
@@ -325,7 +415,7 @@ async fn main() -> Result<()> {
     local_shutdown.recv().await;
     info!("Shutting down daemon");
 
-    if let Some(server) = http_server {
+    if let Ok(Some(server)) = http_server {
         // We only need to Join on the HTTP Server if it exists..
         let _ = join!(
             usb_handle,

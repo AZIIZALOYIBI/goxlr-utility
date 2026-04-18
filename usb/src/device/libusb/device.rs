@@ -3,16 +3,17 @@ use crate::device::base::{
     AttachGoXLR, ExecutableGoXLR, FullGoXLRDevice, GoXLRCommands, GoXLRDevice, UsbData,
 };
 use crate::{PID_GOXLR_FULL, PID_GOXLR_MINI, VID_GOXLR};
-use anyhow::{anyhow, bail, Error, Result};
+use anyhow::{Error, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
+use goxlr_types::{DriverInterface, VersionNumber};
 use log::{debug, error, info, warn};
 use rusb::Error::Pipe;
 use rusb::{
     Device, DeviceDescriptor, DeviceHandle, Direction, GlobalContext, Language, Recipient,
     RequestType,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -44,10 +45,9 @@ impl GoXLRUSB {
             for usb_device in devices.iter() {
                 if usb_device.bus_number() == device.bus_number
                     && usb_device.address() == device.address
+                    && let Ok(descriptor) = usb_device.device_descriptor()
                 {
-                    if let Ok(descriptor) = usb_device.device_descriptor() {
-                        return Ok((usb_device, descriptor));
-                    }
+                    return Ok((usb_device, descriptor));
                 }
             }
         }
@@ -143,16 +143,16 @@ impl AttachGoXLR for GoXLRUSB {
         disconnect_sender: Sender<String>,
         event_sender: Sender<String>,
         _skip_pause: bool,
-    ) -> Result<Box<(dyn FullGoXLRDevice)>> {
+    ) -> Result<Box<dyn FullGoXLRDevice>> {
         // Firstly, we need to locate the USB device based on the location..
         let (device, descriptor) = GoXLRUSB::find_device(device)?;
-        let mut handle = device.open()?;
+        let handle = device.open()?;
 
         let timeout = Duration::from_secs(1);
 
         let languages = handle.read_languages(timeout)?;
         let language = languages
-            .get(0)
+            .first()
             .ok_or_else(|| anyhow!("Not GoXLR?"))?
             .to_owned();
 
@@ -183,6 +183,10 @@ impl AttachGoXLR for GoXLRUSB {
         if result == Err(Pipe) {
             // The GoXLR is not initialised, we need to fix that..
             info!("Found uninitialised GoXLR, attempting initialisation..");
+
+            // Before we claim the interface, give things like Pipewire a change to finish up..
+            sleep(Duration::from_millis(1500));
+
             if device_is_claimed {
                 goxlr.handle.release_interface(0)?;
             }
@@ -198,10 +202,12 @@ impl AttachGoXLR for GoXLRUSB {
             // Now activate audio..
             debug!("Activating Audio...");
             goxlr.write_class_control(1, 0x0100, 0x2900, &[0x80, 0xbb, 0x00, 0x00])?;
-            goxlr.handle.release_interface(0)?;
 
             // Reset the device, so ALSA can pick it up again..
             goxlr.handle.reset()?;
+
+            // Now release the interface, so ALSA doesn't catch it mid reset..
+            goxlr.handle.release_interface(0)?;
 
             // Reattempt the reset..
             goxlr.write_control(1, 0, 0, &[])?;
@@ -209,9 +215,6 @@ impl AttachGoXLR for GoXLRUSB {
             warn!(
                 "Initialisation complete. If you are using the JACK script, you may need to reboot for audio to work."
             );
-
-            // Pause for a second, as we can grab devices a little too quickly!
-            sleep(Duration::from_secs(2));
         }
 
         // Force command pipe activation in all cases.
@@ -276,9 +279,9 @@ impl AttachGoXLR for GoXLRUSB {
         false
     }
 
-    fn stop_polling(&mut self) {
-        warn!("Disabling GoXLR Value Polling");
-        self.stop_polling.store(true, Ordering::Relaxed);
+    fn set_is_polling(&mut self, polling: bool) {
+        warn!("GoXLR Interaction Polling: {}", polling);
+        self.stop_polling.store(!polling, Ordering::Relaxed);
     }
 }
 
@@ -322,11 +325,32 @@ impl ExecutableGoXLR for GoXLRUSB {
         sleep(sleep_time);
 
         let mut response = vec![];
-        for i in 0..20 {
+
+        // Some firmware update messages take longer to process, give more time here and don't
+        // spam about them being delayed.
+        let (count, ignore_warn) = match command {
+            Command::ExecuteFirmwareUpdateAction(_) => (80, true),
+            Command::ExecuteFirmwareUpdateCommand(_) => (80, true),
+            _ => (20, false),
+        };
+        //
+        // if command == Command::ExecuteFirmwareUpdateCommand(REBOOT) {
+        //     warn!("Reboot Command triggered, intentionally failing command");
+        //     self.pause_polling.store(false, Ordering::Relaxed);
+        //     return Ok(vec![]);
+        // }
+
+        for i in 0..count {
             let response_value = self.read_control(3, 0, 0, 1040);
             if response_value == Err(Pipe) {
-                if i < 19 {
-                    debug!("Response not arrived yet for {:?}, sleeping and retrying (Attempt {} of 20)", command, i + 1);
+                if i < count - 1 {
+                    if !ignore_warn {
+                        debug!(
+                            "Response not arrived yet for {:?}, sleeping and retrying (Attempt {} of 20)",
+                            command,
+                            i + 1
+                        );
+                    }
                     sleep(sleep_time);
                     continue;
                 } else {
@@ -454,4 +478,17 @@ pub fn find_devices() -> Vec<GoXLRDevice> {
     }
 
     found_devices
+}
+
+pub fn get_interface_version() -> (DriverInterface, Option<VersionNumber>) {
+    let version = rusb::version();
+    (
+        DriverInterface::LIBUSB,
+        Some(VersionNumber(
+            version.major() as u32,
+            version.minor() as u32,
+            Some(version.micro() as u32),
+            None,
+        )),
+    )
 }

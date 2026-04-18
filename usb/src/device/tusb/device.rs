@@ -3,10 +3,12 @@ use crate::device::base::{
     AttachGoXLR, ExecutableGoXLR, FullGoXLRDevice, GoXLRCommands, GoXLRDevice, UsbData,
 };
 use crate::device::tusb::tusbaudio::{
-    get_devices, DeviceHandle, EventChannelReceiver, EventChannelSender, TUSB_INTERFACE,
+    DeviceHandle, EventChannelReceiver, EventChannelSender, TUSB_INTERFACE, get_devices,
+    get_version,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use byteorder::{ByteOrder, LittleEndian};
+use goxlr_types::{DriverInterface, VersionNumber};
 use log::{debug, error, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,8 +16,8 @@ use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TryRecvError;
 
 pub struct TUSBAudioGoXLR {
     // Basic Device Information..
@@ -69,13 +71,17 @@ impl TUSBAudioGoXLR {
         loop {
             if Instant::now() > timeout {
                 // We've hit a timeout, don't infinite loop, instead throw as error.
+                warn!("Timeout Awaiting Response..");
                 return false;
             }
 
             let result = self.event_receivers.data_read.try_recv();
             match result {
                 Ok(result) => break result,
-                Err(TryRecvError::Disconnected) => break false,
+                Err(TryRecvError::Disconnected) => {
+                    warn!("Channel has been Disconnected");
+                    break false;
+                }
                 Err(_) => continue,
             }
         }
@@ -112,7 +118,7 @@ impl AttachGoXLR for TUSBAudioGoXLR {
     {
         if !skip_pause {
             // Before we do anything, wait 1second in case the GoXLR is still calibrating..
-            sleep(Duration::from_millis(1500));
+            sleep(Duration::from_millis(2000));
         }
 
         let mut device_identifier = None;
@@ -234,7 +240,7 @@ impl AttachGoXLR for TUSBAudioGoXLR {
         true
     }
 
-    fn stop_polling(&mut self) {
+    fn set_is_polling(&mut self, _polling: bool) {
         // The TUSB implementation is event driven, so there's no polling to stop.
     }
 }
@@ -365,4 +371,8 @@ impl FullGoXLRDevice for TUSBAudioGoXLR {}
 
 pub fn find_devices() -> Vec<GoXLRDevice> {
     get_devices()
+}
+
+pub fn get_interface_version() -> (DriverInterface, Option<VersionNumber>) {
+    (DriverInterface::TUSB, get_version())
 }

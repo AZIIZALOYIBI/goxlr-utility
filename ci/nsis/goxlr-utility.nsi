@@ -107,14 +107,18 @@ DEFAULT_NOT_FOUND:
     IfFileExists $0 END ERROR_DEFAULT
 
 ERROR_REG:
-    MessageBox MB_OK|MB_ICONSTOP  "Unable to locate the GoXLR Driver, there may be an issue with your installation."
+    # Registry Entry was missing and file not in default location, driver not installed.
+    MessageBox MB_OK|MB_ICONSTOP  "The GoXLR Driver was not found, please ensure it is installed."
     Goto END
 
 ERROR_DEFAULT:
-    MessageBox MB_OK|MB_ICONSTOP  "The GoXLR Driver was not found, please ensure it is installed."
+    # Registry Entry found, file not present at registry location nor at default location
+    MessageBox MB_OK|MB_ICONSTOP  "Unable to locate the GoXLR Driver, there may be an issue with your installation."
     Abort
 
 END:
+ClearErrors
+
 FunctionEnd
 
 var KeyTest
@@ -183,8 +187,6 @@ var WebViewInstalled
 			StrCpy $WebViewInstalled 1
 
 		WEBVIEW_END:
-
-	END:
         ClearErrors
     FunctionEnd
 !macroend
@@ -212,9 +214,9 @@ Function PerformActions
     !insertmacro INSTALLOPTIONS_EXTRACT "post-install.ini"
 
     ; Set any cached values..
-    AUTO_START:
-        StrCmp $AutoStartRegSet 1 0 USE_APP
-        !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 2" "State" $AutoStartReg
+    StrCmp $AutoStartRegSet 1 0 USE_APP
+    !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 2" "State" $AutoStartReg
+
     USE_APP:
         StrCmp $UseAppRegSet 1 0 END
         !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 3" "State" $UseAppReg
@@ -232,7 +234,7 @@ FunctionEnd
 
 Function IsUtilRunning
 ; The util spawns a window we can look for..
-FindWindow $0 "goxlr-utility"
+FindWindow $0 "GoXLR Utility"
 StrCmp $0 0 STOP
     ReserveFile "running-warn.ini"
     !insertmacro MUI_HEADER_TEXT "Preparing to Install" "Setup is preparing to install ${PRODUCT_NAME} on your computer."
@@ -243,8 +245,6 @@ StrCmp $0 0 STOP
 
 STOP:
     Abort
-    Goto END
-
 END:
 FunctionEnd
 
@@ -253,7 +253,7 @@ Var count
 Function ${un}StopUtility
 DetailPrint "Checking for GoXLR Utility.."
 
-FindWindow $0 "goxlr-utility"
+FindWindow $0 "GoXLR Utility"
 StrCmp $0 0 END
 DetailPrint "GoXLR Utility Found, attempting to stop.."
 
@@ -262,7 +262,7 @@ SendMessage $0 ${WM_CLOSE} 0 0
 StrCpy $count 0
 
 LOOP:
-FindWindow $0 "goxlr-utility"
+FindWindow $0 "GoXLR Utility"
 StrCmp $0 0 ENDSLEEP
 Sleep 100
 IntOp $count $count + 1
@@ -308,29 +308,43 @@ Function CleanOldInstaller
 FunctionEnd
 
 Function InstallWebView
+    DetailPrint "Installing Edge Webview"
+    SetOutPath "$TEMP"
 
 	Delete "$TEMP\MicrosoftEdgeWebview2Setup.exe"
-	nsis_tauri_utils::download "https://go.microsoft.com/fwlink/p/?LinkId=2124703" "$TEMP\MicrosoftEdgeWebview2Setup.exe"
-	Pop $0
+	File "MicrosoftEdgeWebview2Setup.exe"
 
-	${IfNot} $0 == 0
-		DetailPrint "Unable to Download WebView2 Setup, continuing without."
-		Goto END
-	${EndIf}
-
-	DetailPrint "Installing WebView2"
 	ExecWait "$TEMP\MicrosoftEdgeWebview2Setup.exe /silent /install" $1
 	${IfNot} $1 == 0
-		DetailPrint "Failed to install WebView2, continuing without."
-		Goto END
+		DetailPrint "Failed to install WebView Runtime, continuing without."
 	${EndIf}
 
-	END:
+	Delete "$TEMP\MicrosoftEdgeWebview2Setup.exe"
+	ClearErrors
+FunctionEnd
+
+Function InstallVCRuntime
+    DetailPrint "Installing VC Runtime.."
+    SetOutPath "$TEMP"
+
+	Delete "$TEMP\vc_redist.exe"
+	File "vc_redist.exe"
+
+	ExecWait "$TEMP\vc_redist.exe /silent /install /norestart" $1
+	${IfNot} $1 == 0
+		DetailPrint "Failed to install VC Runtime, continuing without."
+	${EndIf}
+
+	Delete "$TEMP\vc_redist.exe"
+	ClearErrors
 FunctionEnd
 
 Section "MainSection" SEC01
     Call StopUtility
     Call CleanOldInstaller
+
+    ; Make sure the Visual C++ Runtime is installed (TODO: Only on first install)
+    Call InstallVCRuntime
 
 	; Make sure WebView2 is installed..
 	${If} $USE_APP == 1
@@ -345,9 +359,9 @@ Section "MainSection" SEC01
     ; Ok, here come the files..
     File "..\..\target\release\goxlr-daemon.exe"
     File "..\..\target\release\goxlr-client.exe"
+    File "..\..\target\release\goxlr-client-quiet.exe"
     File "..\..\target\release\goxlr-defaults.exe"
     File "..\..\target\release\goxlr-launcher.exe"
-    File "..\..\target\release\goxlr-firmware.exe"
     File "..\..\target\release\goxlr-utility-ui.exe"
     File "..\..\target\release\SAAPI64.dll"
     File "..\..\target\release\nvdaControllerClient64.dll"

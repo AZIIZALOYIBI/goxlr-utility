@@ -5,8 +5,8 @@ use enum_map::{Enum, EnumMap};
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
 
 use anyhow::Result;
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesStart, Event};
 
 use crate::components::colours::ColourMap;
 use crate::components::mixer::FullChannelList::LineOut;
@@ -28,9 +28,11 @@ pub enum ParseError {
     InvalidColours(#[from] crate::components::colours::ParseError),
 }
 
+type RoutingTable = EnumMap<InputChannels, EnumMap<OutputChannels, u16>>;
+
 #[derive(Debug)]
 pub struct Mixers {
-    mixer_table: EnumMap<InputChannels, EnumMap<OutputChannels, u16>>,
+    mixer_table: RoutingTable,
     volume_table: EnumMap<FullChannelList, u8>,
     colour_map: ColourMap,
 }
@@ -43,13 +45,52 @@ impl Default for Mixers {
 
 impl Mixers {
     pub fn new() -> Self {
-        // So here's the odd thing, some profiles don't have lineOutLevel set by default,
-        // so we assume 0, the official app assumes 255. We'll fix this here.
+        // Default Everything to 50% volume except LineOut
         let mut volume_table = EnumMap::default();
+        for channel in FullChannelList::iter() {
+            volume_table[channel] = 128;
+        }
         volume_table[LineOut] = 255;
 
+        // Long List incoming, these are the routes enabled in the Default config file...
+        let mut mixer_table: RoutingTable = EnumMap::default();
+        mixer_table[InputChannels::Mic][OutputChannels::Broadcast] = 8192;
+        mixer_table[InputChannels::Mic][OutputChannels::StreamMix2] = 8192;
+        mixer_table[InputChannels::Mic][OutputChannels::ChatMic] = 8192;
+        mixer_table[InputChannels::Mic][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::Mic][OutputChannels::Sampler] = 8192;
+        mixer_table[InputChannels::Mic][OutputChannels::LineOut] = 8192;
+
+        mixer_table[InputChannels::LineIn][OutputChannels::Headphones] = 8192;
+
+        mixer_table[InputChannels::System][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::System][OutputChannels::LineOut] = 8192;
+
+        mixer_table[InputChannels::Game][OutputChannels::Broadcast] = 8192;
+        mixer_table[InputChannels::Game][OutputChannels::StreamMix2] = 8192;
+        mixer_table[InputChannels::Game][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::Game][OutputChannels::LineOut] = 8192;
+
+        mixer_table[InputChannels::Chat][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::Chat][OutputChannels::LineOut] = 8192;
+
+        mixer_table[InputChannels::Music][OutputChannels::Broadcast] = 8192;
+        mixer_table[InputChannels::Music][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::Music][OutputChannels::LineOut] = 8192;
+
+        mixer_table[InputChannels::Sample][OutputChannels::Broadcast] = 8192;
+        mixer_table[InputChannels::Sample][OutputChannels::StreamMix2] = 8192;
+        mixer_table[InputChannels::Sample][OutputChannels::ChatMic] = 8192;
+        mixer_table[InputChannels::Sample][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::Sample][OutputChannels::LineOut] = 8192;
+
+        mixer_table[InputChannels::Console][OutputChannels::Broadcast] = 8192;
+        mixer_table[InputChannels::Console][OutputChannels::StreamMix2] = 8192;
+        mixer_table[InputChannels::Console][OutputChannels::Headphones] = 8192;
+        mixer_table[InputChannels::Console][OutputChannels::LineOut] = 8192;
+
         Self {
-            mixer_table: EnumMap::default(),
+            mixer_table,
             volume_table,
             colour_map: ColourMap::new("mixerTree".to_string()),
         }
@@ -216,6 +257,9 @@ pub enum OutputChannels {
 
     #[strum(props(Name = "Sampler"))]
     Sampler,
+
+    #[strum(props(Name = "VOD"))]
+    StreamMix2,
 }
 
 /**

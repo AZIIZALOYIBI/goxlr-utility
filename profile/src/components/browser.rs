@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::Result;
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesStart, Event};
 
 use crate::components::colours::ColourMap;
 use crate::profile::Attribute;
@@ -66,7 +66,7 @@ impl BrowserPreviewTree {
             }
 
             if attr.name == "file" {
-                self.file = attr.value.clone();
+                self.file.clone_from(&attr.value);
                 continue;
             }
 

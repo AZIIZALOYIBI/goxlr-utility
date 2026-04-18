@@ -16,12 +16,12 @@ jobs:
 
   # Actually Create the Release
   create_release_draft:
-    needs: [verify, get_version, build]
-    runs-on: ubuntu-latest
+    needs: [ verify, get_version, build ]
+    runs-on: ubuntu-22.04
     steps:
       # Download the previously generated artifacts..
       - name: Download Artifacts
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
 
       - name: List Downloaded Files..
         run: ls -lahR
@@ -37,6 +37,10 @@ jobs:
           prerelease: true
           fail_on_unmatched_files: true
           files: |
-            ./debian-artifact/goxlr-utility_${{ needs.get_version.outputs.version }}_amd64.deb
+            ./debian-artifact/goxlr-utility_${{ needs.get_version.outputs.version }}-1_amd64.deb
             ./rpm-artifact/goxlr-utility-${{ needs.get_version.outputs.version }}-1.x86_64.rpm
+            ./rpm-artifact/goxlr-utility-${{ needs.get_version.outputs.version }}-suse.x86_64.rpm
             ./windows-artifact/goxlr-utility-${{ needs.get_version.outputs.version }}.exe
+            ./windows-artifact-arm/goxlr-utility-${{ needs.get_version.outputs.version }}-arm64.exe
+            ./macos-artifact/goxlr-utility-macos-${{ needs.get_version.outputs.version }}-intel.pkg
+            ./macos-artifact/goxlr-utility-macos-${{ needs.get_version.outputs.version }}-m1.pkg

@@ -1,12 +1,5 @@
-use crate::device::base::GoXLRDevice;
-use crate::{PID_GOXLR_FULL, PID_GOXLR_MINI, VID_GOXLR};
-use anyhow::{anyhow, bail, Result};
-use byteorder::{ByteOrder, LittleEndian};
-use lazy_static::lazy_static;
-use libloading::{Library, Symbol};
-use log::{debug, error, info, warn};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ffi::CStr;
 use std::hash::Hash;
 use std::path::PathBuf;
@@ -15,19 +8,35 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+
+use anyhow::{Result, anyhow, bail};
+use byteorder::{ByteOrder, LittleEndian};
+use lazy_static::lazy_static;
+use libloading::{Library, Symbol};
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
 use widestring::U16CStr;
-use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeA,
+    CM_Get_Device_Interface_ListA, CR_SUCCESS,
+};
+use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
-use winreg::enums::HKEY_CLASSES_ROOT;
+use windows::core::GUID;
 use winreg::RegKey;
+use winreg::enums::HKEY_CLASSES_ROOT;
+
+use goxlr_types::VersionNumber;
+
+use crate::device::base::GoXLRDevice;
 
 // Define the Types of the various methods..
 type EnumerateDevices = unsafe extern "C" fn() -> u32;
+type GetDriverInfo = unsafe extern "C" fn(*mut DriverInfo) -> u32;
 type GetAPIVersion = unsafe extern "C" fn() -> ApiVersion;
 type CheckAPIVersion = unsafe extern "C" fn(u32, u32) -> bool;
 type GetDeviceCount = unsafe extern "C" fn() -> u32;
-type OpenDeviceByIndex = unsafe extern "C" fn(u32, &u32) -> u32;
+type OpenDeviceByIndex = unsafe extern "C" fn(u32, *mut u32) -> u32;
 type GetDeviceInstanceIdString = unsafe extern "C" fn(u32, *const u16, u32) -> u32;
 type GetDeviceProperties = unsafe extern "C" fn(u32, *mut Properties) -> u32;
 type GetUsbConfigDescriptor = unsafe extern "C" fn(u32, *mut u8, u32, &u32) -> u32;
@@ -37,14 +46,15 @@ type VendorRequestIn =
     unsafe extern "C" fn(u32, u32, u32, u32, u32, u16, u16, *mut u8, *mut u8, u32) -> u32;
 type RegisterDeviceNotification = unsafe extern "C" fn(u32, u32, HANDLE, u32) -> u32;
 type RegisterPnpNotification = unsafe extern "C" fn(HANDLE, HANDLE, u32, u32, u32) -> u32;
-type ReadDeviceNotification = unsafe extern "C" fn(u32, &u32, *mut u8, u32, &u32) -> u32;
+type ReadDeviceNotification = unsafe extern "C" fn(u32, *const u32, *mut u8, u32, *mut u32) -> u32;
 type StatusCodeString = unsafe extern "C" fn(u32) -> *const i8;
 type CloseDevice = unsafe extern "C" fn(u32) -> u32;
 
+static GOXLR_GUID: GUID = GUID::from_u128(0x024D0372_641F_4B7B_8140_F4DFE458C982);
 lazy_static! {
     // Initialise the Library..
     static ref LIBRARY: Library = unsafe {
-       libloading::Library::new(locate_library().as_str()).expect("Unable to Load GoXLR API Driver")
+       Library::new(locate_library().as_str()).expect("Unable to Load GoXLR API Driver")
     };
     pub static ref TUSB_INTERFACE: TUSBAudio<'static> = TUSBAudio::new().expect("Unable to Parse GoXLR API Driver");
 }
@@ -70,7 +80,6 @@ fn locate_library() -> String {
 #[allow(dead_code)]
 pub struct TUSBAudio<'lib> {
     // Need to enumerate..
-    initial_enumeration: Arc<Mutex<bool>>,
     pnp_thread_running: Arc<Mutex<bool>>,
     discovered_devices: Arc<Mutex<Vec<String>>>,
 
@@ -106,7 +115,8 @@ impl TUSBAudio<'_> {
         let get_api_version: Symbol<_> = unsafe { LIBRARY.get(b"TUSBAUDIO_GetApiVersion")? };
         let check_api_version = unsafe { LIBRARY.get(b"TUSBAUDIO_CheckApiVersion")? };
 
-        let enumerate_devices = unsafe { LIBRARY.get(b"TUSBAUDIO_EnumerateDevices")? };
+        let enumerate_devices =
+            unsafe { LIBRARY.get::<EnumerateDevices>(b"TUSBAUDIO_EnumerateDevices")? };
         let open_device_by_index = unsafe { LIBRARY.get(b"TUSBAUDIO_OpenDeviceByIndex")? };
 
         let get_device_count = unsafe { LIBRARY.get(b"TUSBAUDIO_GetDeviceCount")? };
@@ -126,8 +136,10 @@ impl TUSBAudio<'_> {
         let status_code_string = unsafe { LIBRARY.get(b"TUSBAUDIO_StatusCodeStringA")? };
         let close_device = unsafe { LIBRARY.get(b"TUSBAUDIO_CloseDevice")? };
 
+        debug!("Performing initial Enumeration..");
+        unsafe { (enumerate_devices)() };
+
         let tusb_audio = Self {
-            initial_enumeration: Arc::new(Mutex::new(false)),
             pnp_thread_running: Arc::new(Mutex::new(false)),
             discovered_devices: Arc::new(Mutex::new(Vec::new())),
 
@@ -152,29 +164,61 @@ impl TUSBAudio<'_> {
         };
 
         let api_version = unsafe { (tusb_audio.get_api_version)() };
-        if api_version.major != 7 || api_version.minor != 5 {
-            warn!(
-                "API VERSION DETECTED: {}.{}",
-                api_version.major, api_version.minor
-            );
-            warn!("API VERSION MISMATCH: This code was made with Version 7.5 of the API");
-            warn!("Please install version 5.12.0 of the GoXLR Drivers");
-            warn!("We'll try to keep going, but you may experience instability");
-        } else {
+
+        // API Version Checking (7.5, 11.5, 12.5 are valid)
+        if (api_version.major == 12 || api_version.major == 11 || api_version.major == 7)
+            && api_version.minor == 5
+        {
             info!(
                 "Using GoXLR API Version {}.{}",
                 api_version.major, api_version.minor
             );
+        } else {
+            warn!(
+                "API VERSION DETECTED: {}.{}",
+                api_version.major, api_version.minor
+            );
+            warn!(
+                "API VERSION MISMATCH: This code was made with Versions 7.5 / 11.5 / 12.5 of the API"
+            );
+            warn!("Please install version 5.12, 5.57 or 5.68 of the GoXLR Drivers");
+            warn!("We'll try to keep going, but you may experience instability");
         }
 
         Ok(tusb_audio)
+    }
+
+    pub fn get_driver_version(&self) -> Option<VersionNumber> {
+        match unsafe { LIBRARY.get::<GetDriverInfo>(b"TUSBAUDIO_GetDriverInfo") } {
+            Ok(get_driver_info) => {
+                debug!("Fetching Versioning Information..");
+                let mut driver_info = DriverInfo::default();
+                let driver_info_ptr: *mut DriverInfo = &mut driver_info;
+                let result = unsafe { (get_driver_info)(driver_info_ptr) };
+                if result != 0 {
+                    warn!("Unable to Get Driver Info: {}", self.get_error(result));
+                    return None;
+                }
+
+                Some(VersionNumber(
+                    driver_info.driver_major,
+                    driver_info.driver_minor,
+                    Some(driver_info.driver_patch),
+                    None,
+                ))
+            }
+            Err(e) => {
+                warn!("Unable to Get Driver Info: {}", e);
+                None
+            }
+        }
     }
 
     fn get_error(&self, error: u32) -> String {
         let res = unsafe { (self.status_code_string)(error) };
         let text = unsafe { CStr::from_ptr(res) };
 
-        return text.to_string_lossy().to_string();
+        text.to_string_lossy().to_string()
     }
 
     // We need to mildly abuse inner mutability here, due to the nature of lazy_static..
@@ -188,9 +232,19 @@ impl TUSBAudio<'_> {
 
         let device_count = self.get_device_count();
         for i in 0..device_count {
-            let handle = self.open_device_by_index(i)?;
-            result_vec.push(self.get_device_id_string(handle)?);
-            self.close_device(handle)?;
+            match self.open_device_by_index(i) {
+                Ok(handle) => {
+                    match self.get_device_id_string(handle) {
+                        Ok(handle) => result_vec.push(handle),
+                        Err(e) => warn!("Unable to Open Device Handle: {}", e),
+                    }
+                    // Try to close it, just in case..
+                    let _ = self.close_device(handle);
+                }
+                Err(e) => {
+                    error!("Unable to Open Device: {}", e);
+                }
+            }
         }
 
         // All devices handled, replace the stored vec..
@@ -201,15 +255,6 @@ impl TUSBAudio<'_> {
     }
 
     pub fn get_devices(&self) -> Vec<String> {
-        let mut initial_check = self.initial_enumeration.lock().unwrap();
-        if !*initial_check {
-            if let Err(error) = self.detect_devices() {
-                error!("Error Detecting Devices: {}", error);
-                return Vec::new();
-            }
-            *initial_check = true;
-        }
-
         self.discovered_devices.lock().unwrap().clone()
     }
 
@@ -235,16 +280,16 @@ impl TUSBAudio<'_> {
     }
 
     fn get_device_id_string(&self, handle: u32) -> Result<String> {
-        let buffer: Vec<u16> = Vec::with_capacity(100);
+        let buffer: Vec<u16> = Vec::with_capacity(256);
         let buffer_pointer = buffer.as_ptr();
-        let result = unsafe { (self.get_device_id_string)(handle, buffer_pointer, 100) };
+        let result = unsafe { (self.get_device_id_string)(handle, buffer_pointer, 256) };
 
         if result != 0 {
             let error = self.get_error(result);
             bail!("Error Getting Device Id: {}", error);
         }
 
-        let device_id = unsafe { U16CStr::from_ptr_truncate(buffer_pointer, 100)? };
+        let device_id = unsafe { U16CStr::from_ptr_truncate(buffer_pointer, 256)? };
         Ok(device_id.to_string_lossy())
     }
 
@@ -347,11 +392,13 @@ impl TUSBAudio<'_> {
     }
 
     fn open_device_by_index(&self, device_index: u32) -> Result<u32> {
-        let handle: u32 = 0;
-        let result = unsafe { (self.open_device_by_index)(device_index, &handle) };
+        let mut handle: u32 = 0;
+        let ptr: *mut u32 = &mut handle;
+        let result = unsafe { (self.open_device_by_index)(device_index, ptr) };
         if result == 0 {
             return Ok(handle);
         }
+
         bail!("Unable to Open Device: {}", result)
     }
 
@@ -379,14 +426,19 @@ impl TUSBAudio<'_> {
         // Register this event with the notifier..
         let result = unsafe { (self.register_device_notification)(handle, u32::MAX, event, 0) };
         if result != 0 {
+            warn!("Unable to Register Notifications");
             bail!("Unable to register notifications");
         }
 
         // Assign useful variables for later :p
-        let mut buffer: Vec<u8> = Vec::with_capacity(1024);
-        let buffer_ptr = buffer.as_mut_ptr();
-        let a: u32 = 0;
-        let response_len: u32 = 0;
+        let buffer = vec![0_u8; 1024];
+        let buffer_ptr = &buffer as *const _ as *mut u8;
+
+        let mut response_len: u32 = 0;
+        let len_ptr: *mut u32 = &mut response_len;
+
+        // Honestly don't know what this variable does, but 0 seems to work.
+        let a = 0;
 
         if callbacks.ready_notifier.send(true).is_err() {
             warn!("Error Sending Ready Notification..");
@@ -397,11 +449,11 @@ impl TUSBAudio<'_> {
         loop {
             // Wait for the event Trigger (I'd love for this to be async one day :p)..
             let wait_result = unsafe { WaitForSingleObject(event, 500) };
-            if wait_result != WIN32_ERROR(258) {
+            if wait_result != WAIT_TIMEOUT {
                 // Check the Queued Events :)
                 loop {
                     let event_result = unsafe {
-                        (self.read_device_notification)(handle, &a, buffer_ptr, 1024, &response_len)
+                        (self.read_device_notification)(handle, &a, buffer_ptr, 1024, len_ptr)
                     };
                     if event_result != 0 {
                         // We've either hit the end of the list, or something's gone wrong, break
@@ -414,6 +466,11 @@ impl TUSBAudio<'_> {
 
                     let event_response =
                         unsafe { std::slice::from_raw_parts(buffer_ptr, response_len as usize) };
+
+                    // Generally caused by an 'audio end' event.
+                    if event_response.is_empty() {
+                        continue;
+                    }
 
                     if event_response.len() != 6 {
                         debug!(
@@ -436,18 +493,20 @@ impl TUSBAudio<'_> {
                         continue;
                     }
 
-                    if event_response[0] == 1 && event_response[1] == 1 && event_response[2] == 0 {
-                        if let Some(identifier) = &*identifier.lock().unwrap() {
-                            // A button or fader interrupt has been received.
-                            if callbacks.input_changed.capacity() > 0 {
-                                let se = callbacks.input_changed.blocking_send(identifier.clone());
-                                if se.is_err() {
-                                    warn!("Error sending Callback! {:?}", se.err());
+                    if event_response[0] == 1
+                        && event_response[1] == 1
+                        && event_response[2] == 0
+                        && let Some(identifier) = &*identifier.lock().unwrap()
+                    {
+                        // A button or fader interrupt has been received.
+                        if callbacks.input_changed.capacity() > 0 {
+                            let se = callbacks.input_changed.blocking_send(identifier.clone());
+                            if se.is_err() {
+                                warn!("Error sending Callback! {:?}", se.err());
 
-                                    // Something's gone horribly wrong!
-                                    terminator.store(true, Ordering::Relaxed);
-                                    break;
-                                }
+                                // Something's gone horribly wrong!
+                                terminator.store(true, Ordering::Relaxed);
+                                break;
                             }
                         }
                     }
@@ -521,7 +580,7 @@ impl TUSBAudio<'_> {
 
             loop {
                 let wait_result = unsafe { WaitForSingleObject(event, 1000) };
-                if wait_result == WIN32_ERROR(258) {
+                if wait_result == WAIT_TIMEOUT {
                     // Timeout on wait, go again!
                     continue;
                 }
@@ -535,76 +594,167 @@ impl TUSBAudio<'_> {
         Ok(())
     }
 
-    pub fn spawn_pnp_handle_rusb(&self) -> Result<()> {
+    pub fn spawn_pnp_handle_win32(&self) -> Result<()> {
         let mut spawned = self.pnp_thread_running.lock().unwrap();
         if *spawned {
-            bail!("Handler Thread already running..");
+            bail!("Handler Thread already running...");
         }
+        debug!("Spawning Win32 PnP Handler Thread");
 
-        debug!("Spawning RUSB PnP Thread");
-
-        // We should not return from this method until at least one run has been done by the
-        // thread, this is primarily to prevent conflicts on startup when everything changes.
-
-        let started = Arc::new(AtomicBool::new(false));
-        let started_inner = started.clone();
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<bool>();
 
         thread::spawn(move || -> Result<()> {
-            let mut devices = vec![];
+            let mut ready_sender = Some(ready_tx);
 
             loop {
-                let mut found_devices = vec![];
+                let length = 0_u64;
+                let result = unsafe {
+                    CM_Get_Device_Interface_List_SizeA(
+                        &length as *const _ as *mut _,
+                        &GOXLR_GUID as *const _,
+                        None,
+                        CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                    )
+                };
 
-                if let Ok(devices) = rusb::devices() {
-                    for device in devices.iter() {
-                        if let Ok(descriptor) = device.device_descriptor() {
-                            let bus_number = device.bus_number();
-                            let address = device.address();
-
-                            if descriptor.vendor_id() == VID_GOXLR
-                                && (descriptor.product_id() == PID_GOXLR_FULL
-                                    || descriptor.product_id() == PID_GOXLR_MINI)
-                            {
-                                found_devices.push(USBDevice {
-                                    bus_number,
-                                    address,
-                                });
-                            }
-                        }
-                    }
+                if result != CR_SUCCESS {
+                    // This should only occur if the system is Out of Memory!
+                    warn!("Error Fetching Interface List Size {:?}", result);
+                    sleep(Duration::from_millis(200));
+                    continue;
                 }
 
-                // Make sure our two vecs are the same..
-                if !iters_equal_anyorder(
-                    devices.clone().into_iter(),
-                    found_devices.clone().into_iter(),
-                ) {
-                    debug!("Device Change Detected");
+                let mut output = vec![0_u8; length as usize];
+                let result = unsafe {
+                    CM_Get_Device_Interface_ListA(
+                        &GOXLR_GUID as *const _,
+                        None,
+                        &mut output,
+                        CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                    )
+                };
+
+                if result != CR_SUCCESS {
+                    // This theoretically should only occur if the size has changed since we fetched it
+                    warn!("Error Fetching Interface List {:?}", result);
+                    sleep(Duration::from_millis(200));
+                    continue;
+                }
+
+                let count = output.split(|&v| v == 0).filter(|a| !a.is_empty()).count();
+                if count != TUSB_INTERFACE.get_devices().len() {
+                    debug!("Device Change Detected.");
                     let _ = TUSB_INTERFACE.detect_devices();
-                    devices.clear();
-                    devices.append(&mut found_devices);
                 }
-                if !started_inner.load(Ordering::Relaxed) {
-                    started_inner.store(true, Ordering::Relaxed);
+
+                if let Some(sender) = ready_sender.take() {
+                    let _ = sender.send(true);
                 }
                 sleep(Duration::from_secs(1));
             }
         });
 
-        while !started.load(Ordering::Relaxed) {
+        // Block until the 'ready' message has been sent..
+        while ready_rx.try_recv().is_err() {
             sleep(Duration::from_millis(5));
         }
+        debug!("Win32 PnP Handler Started");
 
         *spawned = true;
         Ok(())
     }
+
+    //#[allow(dead_code)]
+    // pub fn spawn_pnp_handle_rusb(&self) -> Result<()> {
+    //     // Comment for future me: Use CM_Register_Notification instead of rusb
+    //
+    //     let mut spawned = self.pnp_thread_running.lock().unwrap();
+    //     if *spawned {
+    //         bail!("Handler Thread already running..");
+    //     }
+    //
+    //     debug!("Spawning RUSB PnP Thread");
+    //
+    //     // We should not return from this method until at least one run has been done by the
+    //     // thread, this is primarily to prevent conflicts on startup when everything changes.
+    //
+    //     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<bool>();
+    //
+    //     thread::spawn(move || -> Result<()> {
+    //         let mut devices = vec![];
+    //         let mut ready_sender = Some(ready_tx);
+    //
+    //         debug!("PnP Thread Spawned");
+    //         loop {
+    //             let mut found_devices = vec![];
+    //
+    //             if let Ok(devices) = rusb::devices() {
+    //                 for device in devices.iter() {
+    //                     if let Ok(descriptor) = device.device_descriptor() {
+    //                         let bus_number = device.bus_number();
+    //                         let address = device.address();
+    //
+    //                         if descriptor.vendor_id() == VID_GOXLR
+    //                             && (descriptor.product_id() == PID_GOXLR_FULL
+    //                                 || descriptor.product_id() == PID_GOXLR_MINI)
+    //                         {
+    //                             found_devices.push(USBDevice {
+    //                                 bus_number,
+    //                                 address,
+    //                             });
+    //                         }
+    //                     }
+    //                 }
+    //             } else {
+    //                 debug!("Unable to Poll Devices");
+    //             }
+    //
+    //             // Make sure our two vecs are the same..
+    //             if !iters_equal_anyorder(
+    //                 devices.clone().into_iter(),
+    //                 found_devices.clone().into_iter(),
+    //             ) {
+    //                 debug!("Device Change Detected");
+    //                 let _ = TUSB_INTERFACE.detect_devices();
+    //                 devices.clear();
+    //                 devices.append(&mut found_devices);
+    //             }
+    //
+    //             // If a driver takes a couple of hundred milliseconds to load, it's theoretically
+    //             // possible that we'll have detected the device and run detect_devices() too early
+    //             // leaving the detected device list empty and causing a desync in the lists.
+    //             //
+    //             // The following simply checks what's already been found, and if the list size
+    //             // isn't the same as we have detected here, attempts to force a resync of the
+    //             // devices from the API.
+    //             if devices.len() != TUSB_INTERFACE.get_devices().len() {
+    //                 debug!("Device Desync Detected, attempting to resync..");
+    //                 let _ = TUSB_INTERFACE.detect_devices();
+    //             }
+    //
+    //             if let Some(sender) = ready_sender.take() {
+    //                 let _ = sender.send(true);
+    //             }
+    //             sleep(Duration::from_secs(1));
+    //         }
+    //     });
+    //
+    //     // Block until the 'ready' message has been sent..
+    //     while ready_rx.try_recv().is_err() {
+    //         sleep(Duration::from_millis(5));
+    //     }
+    //     debug!("RUSB PnP Handler Started");
+    //
+    //     *spawned = true;
+    //     Ok(())
+    // }
 }
 
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-struct USBDevice {
-    pub(crate) bus_number: u8,
-    pub(crate) address: u8,
-}
+// #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+// struct USBDevice {
+//     pub(crate) bus_number: u8,
+//     pub(crate) address: u8,
+// }
 
 pub struct DeviceHandle {
     handle: u32,
@@ -652,6 +802,17 @@ impl DeviceHandle {
 struct ApiVersion {
     major: u16,
     minor: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct DriverInfo {
+    api_major: u32,
+    api_minor: u32,
+    driver_major: u32,
+    driver_minor: u32,
+    driver_patch: u32,
+    flags: u32,
 }
 
 #[repr(C)]
@@ -703,7 +864,7 @@ impl Default for Properties {
 }
 
 pub fn get_devices() -> Vec<GoXLRDevice> {
-    let _ = TUSB_INTERFACE.spawn_pnp_handle_rusb();
+    let _ = TUSB_INTERFACE.spawn_pnp_handle_win32();
     let mut list = Vec::new();
 
     // Ok, this is slightly different now..
@@ -718,6 +879,10 @@ pub fn get_devices() -> Vec<GoXLRDevice> {
     list
 }
 
+pub fn get_version() -> Option<VersionNumber> {
+    TUSB_INTERFACE.get_driver_version()
+}
+
 pub struct EventChannelReceiver {
     pub(crate) data_read: Receiver<bool>,
 }
@@ -728,6 +893,7 @@ pub struct EventChannelSender {
     pub(crate) input_changed: Sender<String>,
 }
 
+#[allow(dead_code)]
 fn iters_equal_anyorder<T: Eq + Hash>(
     i1: impl Iterator<Item = T>,
     i2: impl Iterator<Item = T>,

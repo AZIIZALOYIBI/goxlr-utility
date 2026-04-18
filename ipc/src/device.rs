@@ -1,14 +1,15 @@
-use crate::{GoXLRCommand, LogLevel};
+use crate::{ColourWay, FirmwareSource, GoXLRCommand, LogLevel, UpdateState};
 use enum_map::EnumMap;
 use goxlr_types::MuteState::Unmuted;
 use goxlr_types::{
     AnimationMode, Button, ButtonColourOffStyle, ChannelName, CompressorAttackTime,
-    CompressorRatio, CompressorReleaseTime, DeviceType, DisplayMode, EchoStyle, EffectBankPresets,
-    EncoderColourTargets, EqFrequencies, FaderDisplayStyle, FaderName, FirmwareVersions, GateTimes,
-    GenderStyle, HardTuneSource, HardTuneStyle, InputDevice, MegaphoneStyle, MicrophoneType,
-    MiniEqFrequencies, Mix, MuteFunction, MuteState, OutputDevice, PitchStyle, ReverbStyle,
-    RobotStyle, SampleBank, SampleButtons, SamplePlayOrder, SamplePlaybackMode,
-    SamplerColourTargets, SimpleColourTargets, SubMixChannelName, WaterfallDirection,
+    CompressorRatio, CompressorReleaseTime, DeviceType, DisplayMode, DriverInterface, EchoStyle,
+    EffectBankPresets, EncoderColourTargets, EqFrequencies, FaderDisplayStyle, FaderName,
+    FirmwareDetails, FirmwareVersions, GateTimes, GenderStyle, HardTuneSource, HardTuneStyle,
+    InputDevice, MegaphoneStyle, MicrophoneType, MiniEqFrequencies, Mix, MuteFunction, MuteState,
+    OutputDevice, PitchStyle, ReverbStyle, RobotStyle, SampleBank, SampleButtons, SamplePlayOrder,
+    SamplePlaybackMode, SamplerColourTargets, SimpleColourTargets, SubMixChannelName,
+    VersionNumber, VodMode, WaterfallDirection,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub config: DaemonConfig,
+    pub firmware: HashMap<String, FirmwareStatus>,
     pub mixers: HashMap<String, MixerStatus>,
     pub paths: Paths,
     pub files: Files,
@@ -26,11 +28,37 @@ pub struct DaemonStatus {
 pub struct DaemonConfig {
     pub http_settings: HttpSettings,
     pub daemon_version: String,
+    pub driver_interface: DriverDetails,
+    pub latest_firmware: Option<EnumMap<DeviceType, Option<FirmwareDetails>>>,
+    pub locale: Locale,
+    pub activation: Activation,
     pub autostart_enabled: bool,
     pub show_tray_icon: bool,
     pub tts_enabled: Option<bool>,
     pub allow_network_access: bool,
     pub log_level: LogLevel,
+    pub firmware_source: FirmwareSource,
+    pub open_ui_on_launch: bool,
+    pub platform: String,
+    pub handle_macos_aggregates: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DriverDetails {
+    pub interface: DriverInterface,
+    pub version: Option<VersionNumber>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Locale {
+    pub user_locale: Option<String>,
+    pub system_locale: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Activation {
+    pub active_path: Option<String>,
+    pub app_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -45,6 +73,8 @@ pub struct HttpSettings {
 pub struct MixerStatus {
     pub hardware: HardwareStatus,
     pub shutdown_commands: Vec<GoXLRCommand>,
+    pub sleep_commands: Vec<GoXLRCommand>,
+    pub wake_commands: Vec<GoXLRCommand>,
     pub fader_status: EnumMap<FaderName, FaderStatus>,
     pub mic_status: MicSettings,
     pub levels: Levels,
@@ -57,6 +87,13 @@ pub struct MixerStatus {
     pub button_down: EnumMap<Button, bool>,
     pub profile_name: String,
     pub mic_profile_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirmwareStatus {
+    pub state: UpdateState,
+    pub progress: u8,
+    pub error: Option<String>,
 }
 
 impl MixerStatus {
@@ -79,6 +116,7 @@ pub struct HardwareStatus {
     pub serial_number: String,
     pub manufactured_date: String,
     pub device_type: DeviceType,
+    pub colour_way: ColourWay,
     pub usb_device: UsbProductInformation,
 }
 
@@ -260,6 +298,7 @@ pub struct Reverb {
     pub diffuse: i8,
     pub mod_speed: i8,
     pub mod_depth: i8,
+    pub raw_encoder: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +313,7 @@ pub struct Echo {
     pub feedback_right: u8,
     pub feedback_xfb_l_to_r: u8,
     pub feedback_xfb_r_to_l: u8,
+    pub raw_encoder: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,12 +321,14 @@ pub struct Pitch {
     pub style: PitchStyle,
     pub amount: i8,
     pub character: u8,
+    pub raw_encoder: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gender {
     pub style: GenderStyle,
     pub amount: i8,
+    pub raw_encoder: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +405,10 @@ pub struct Settings {
     pub mute_hold_duration: u16,
     pub vc_mute_also_mute_cm: bool,
     pub enable_monitor_with_fx: bool,
+    pub reset_sampler_on_clear: bool,
+    pub lock_faders: bool,
+    pub fade_duration: u32,
+    pub vod_mode: VodMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,11 +434,17 @@ pub struct Files {
     pub profiles: Vec<String>,
     pub mic_profiles: Vec<String>,
     pub presets: Vec<String>,
-    pub samples: BTreeMap<String, String>,
+    pub samples: BTreeMap<String, SampleFile>,
     pub icons: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleFile {
+    pub name: String,
+    pub gain_pct: u8,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Scribble {
     pub file_name: Option<String>,
     pub bottom_text: Option<String>,

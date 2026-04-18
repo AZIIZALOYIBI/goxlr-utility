@@ -1,49 +1,63 @@
-use anyhow::{bail, Result};
-use interprocess::local_socket::tokio::{LocalSocketListener, LocalSocketStream};
-use interprocess::local_socket::NameTypeSupport;
+use anyhow::{Result, bail};
+use goxlr_ipc::clients::ipc::ipc_socket::Socket;
+use goxlr_ipc::{DaemonRequest, DaemonResponse};
+use interprocess::local_socket::tokio::prelude::{LocalSocketListener, LocalSocketStream};
+use interprocess::local_socket::traits::tokio::{Listener, Stream};
+use interprocess::local_socket::{
+    GenericFilePath, GenericNamespaced, ListenerOptions, ToFsName, ToNsName,
+};
 use log::{debug, info, warn};
 use std::fs;
 use std::path::Path;
 
-use NameTypeSupport::*;
-
-use goxlr_ipc::clients::ipc::ipc_socket::Socket;
-use goxlr_ipc::{DaemonRequest, DaemonResponse};
-
+use crate::Shutdown;
 use crate::primary_worker::DeviceSender;
 use crate::servers::server_packet::handle_packet;
-use crate::Shutdown;
 
 static SOCKET_PATH: &str = "/tmp/goxlr.socket";
 static NAMED_PIPE: &str = "@goxlr.socket";
 
 async fn ipc_tidy() -> Result<()> {
-    // We only need a possible cleanup if we're using file based sockets..
-    let socket_type = NameTypeSupport::query();
-    if socket_type == OnlyNamespaced {
-        return Ok(());
-    }
+    // We only need a possible cleanup if we're using file based sockets, this has changed
+    // substantially with the latest interprocess crate, so we're OS based now..
+    let socket_type = if cfg!(windows) {
+        NAMED_PIPE.to_ns_name::<GenericNamespaced>()?
+    } else {
+        if !Path::new(SOCKET_PATH).exists() {
+            return Ok(());
+        }
+        SOCKET_PATH.to_fs_name::<GenericFilePath>()?
+    };
 
-    // Check to see if the socket exists,
-    if !Path::new(SOCKET_PATH).exists() {
-        return Ok(());
-    }
-
-    debug!("Existing Socket Present, testing..");
-    // Try sending a message to the socket, see if we get a reply..
-    let connection = LocalSocketStream::connect(SOCKET_PATH).await;
+    let connection = LocalSocketStream::connect(socket_type).await;
     if connection.is_err() {
-        debug!("Unable to connect to the socket, removing..");
-        fs::remove_file(SOCKET_PATH)?;
+        match cfg!(windows) {
+            true => {
+                debug!("Named Pipe not running, continuing..");
+            }
+            false => {
+                debug!("Connection Failed. Socket File is stale, removing..");
+                fs::remove_file(SOCKET_PATH)?;
+            }
+        }
         return Ok(());
     }
 
     debug!("Connected to socket, seeing if there's a Daemon on the other side..");
     let connection = connection.unwrap();
+
     let mut socket: Socket<DaemonResponse, DaemonRequest> = Socket::new(connection);
-    if socket.send(DaemonRequest::Ping).await.is_err() {
-        debug!("Socket Not Active, removing file..");
-        fs::remove_file(SOCKET_PATH)?;
+    if let Err(e) = socket.send(DaemonRequest::Ping).await {
+        match cfg!(windows) {
+            true => {
+                debug!("Our named pipe is broken, something is horribly wrong..");
+                bail!("Named Pipe Error: {}", e);
+            }
+            false => {
+                debug!("Unable to send messages, removing socket..");
+                fs::remove_file(SOCKET_PATH)?;
+            }
+        }
         return Ok(());
     }
 
@@ -54,15 +68,16 @@ async fn ipc_tidy() -> Result<()> {
 pub async fn bind_socket() -> Result<LocalSocketListener> {
     ipc_tidy().await?;
 
-    let name = {
-        match NameTypeSupport::query() {
-            OnlyPaths | Both => SOCKET_PATH,
-            OnlyNamespaced => NAMED_PIPE,
-        }
+    let name = if cfg!(windows) {
+        NAMED_PIPE.to_ns_name::<GenericNamespaced>()?
+    } else {
+        SOCKET_PATH.to_fs_name::<GenericFilePath>()?
     };
 
-    let listener = LocalSocketListener::bind(name)?;
-    info!("Bound IPC Socket @ {}", name);
+    let opts = ListenerOptions::new().name(name.clone());
+    let listener = opts.create_tokio()?;
+
+    info!("Bound IPC Socket @ {:?}", name);
     Ok(listener)
 }
 
@@ -82,12 +97,8 @@ pub async fn spawn_ipc_server(
                 });
             }
             () = shutdown_signal.recv() => {
-                // If we're using a unix domain socket, remove it.
-                match NameTypeSupport::query() {
-                    OnlyPaths | Both => {
-                        let _ = fs::remove_file(SOCKET_PATH);
-                    },
-                    OnlyNamespaced => {},
+                if !cfg!(windows) {
+                    let _ = fs::remove_file(SOCKET_PATH);
                 }
                 return;
             }
@@ -115,7 +126,13 @@ async fn handle_connection(
                     }
                 }
             },
-            Err(e) => warn!("Invalid message from {:?}: {}", socket.address(), e),
+            Err(e) => {
+                warn!("Invalid message from {:?}: {}", socket.address(), e);
+                if let Err(e) = socket.send(DaemonResponse::Error(e.to_string())).await {
+                    warn!("Could not reply to {:?}: {}", socket.address(), e);
+                    return;
+                }
+            }
         }
     }
     debug!("Disconnected {:?}", socket.address());

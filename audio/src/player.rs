@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 use core::default::Default;
 use ebur128::{EbuR128, Mode};
@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::audio::{get_output, AudioSpecification};
 use crate::AtomicF64;
+use crate::audio::{AudioSpecification, get_output};
 use symphonia::core::audio::{Layout, SampleBuffer, SignalSpec};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::{SeekMode, SeekTo};
@@ -23,11 +23,14 @@ pub struct Player {
     probe: ProbeResult,
 
     volume: f32,
+
+    // I should really introduce messaging for this..
     stopping: Arc<AtomicBool>,
     force_stop: Arc<AtomicBool>,
+    restart_track: Arc<AtomicBool>,
 
     device: Option<String>,
-    fade_duration: Option<f32>,
+    fade_duration: Option<u32>,
     start_pct: Option<f64>,
     stop_pct: Option<f64>,
     gain: Option<f64>,
@@ -45,7 +48,7 @@ impl Player {
     pub fn new(
         file: &PathBuf,
         device: Option<String>,
-        fade_duration: Option<f32>,
+        fade_duration: Option<u32>,
         start_pct: Option<f64>,
         stop_pct: Option<f64>,
         gain: Option<f64>,
@@ -62,6 +65,7 @@ impl Player {
             volume: 1.0_f32,
             stopping: Arc::new(AtomicBool::new(false)),
             force_stop: Arc::new(AtomicBool::new(false)),
+            restart_track: Arc::new(AtomicBool::new(false)),
 
             progress: Arc::new(AtomicU8::new(0)),
             error: Arc::new(Mutex::new(None)),
@@ -80,10 +84,10 @@ impl Player {
     fn load_file(file: &PathBuf) -> symphonia::core::errors::Result<ProbeResult> {
         // Use the file extension to get a type hint..
         let mut hint = Hint::new();
-        if let Some(extension) = file.extension() {
-            if let Some(extension_str) = extension.to_str() {
-                hint.with_extension(extension_str);
-            }
+        if let Some(extension) = file.extension()
+            && let Some(extension_str) = extension.to_str()
+        {
+            hint.with_extension(extension_str);
         }
 
         let media_source = Box::new(File::open(file).unwrap());
@@ -92,13 +96,7 @@ impl Player {
         let format_options = Default::default();
         let metadata_options = Default::default();
 
-        let probe_result = symphonia::default::get_probe().format(
-            &hint,
-            stream,
-            &format_options,
-            &metadata_options,
-        );
-        probe_result
+        symphonia::default::get_probe().format(&hint, stream, &format_options, &metadata_options)
     }
 
     pub fn calculate_gain(&mut self) {
@@ -162,8 +160,20 @@ impl Player {
                 ebu_r128 = Some(EbuR128::new(channels as u32, rate, Mode::I)?);
             } else {
                 if let Some(fade_duration) = self.fade_duration {
-                    // Calculate the Change in Volume per sample..
-                    fade_amount = Some(1.0 / (rate as f32 * fade_duration) / channels as f32);
+                    // When fading out, we need work out the number of samples related to the fade
+                    // duration, so (rate * duration) should give us the expected frame count, but
+                    // we also need to multiply by the channel count to get the sample count.
+                    //
+                    // Once we have that calculated, we need to convert it to a volume multiplier,
+                    // so for example, 48,000hz * 0.5 * 2 channels = 48,000 samples
+                    // 1.0 / 48000 = 0.00002(ish), and we'll subtract that from the volume
+                    // (between 1 and 0) for every sample received.
+                    //
+                    // This should have the volume at 0 after 48,000 iterations, at which point
+                    // we terminate.
+                    fade_amount = Some(
+                        1.0 / ((rate as f32 * (fade_duration as f32 / 1000f32)) * channels as f32),
+                    );
                 }
 
                 if let Some(frames) = frames {
@@ -213,11 +223,10 @@ impl Player {
             0
         };
 
-        let mut break_playback = false;
         let mut mono_playback = false;
 
         // Loop over the input file..
-        let result = loop {
+        let result = 'main: loop {
             let packet = match reader.next_packet() {
                 Ok(packet) => packet,
                 Err(err) => {
@@ -260,7 +269,7 @@ impl Player {
 
                     if let Some(ref mut buf) = sample_buffer {
                         // Grab out the samples..
-                        buf.copy_interleaved_ref(decoded.clone());
+                        buf.copy_interleaved_ref(decoded);
                         let mut samples = buf.samples().to_vec();
 
                         if mono_playback {
@@ -296,12 +305,7 @@ impl Player {
                             if self.force_stop.load(Ordering::Relaxed) {
                                 // Don't care about the buffer, just end it.
                                 debug!("Force Stop Requested, terminating.");
-
-                                if let Some(audio_output) = &mut audio_output {
-                                    audio_output.stop();
-                                }
-
-                                break Ok(());
+                                break 'main Ok(());
                             }
 
                             if let Some(fade_amount) = fade_amount {
@@ -309,21 +313,19 @@ impl Player {
                                 // so each channel will have a slightly different volume, for now it's small enough to not
                                 // actually notice :p
 
-                                for i in 0..=samples.len() - 1 {
-                                    samples[i] *= self.volume;
+                                for sample in samples.iter_mut() {
+                                    *sample *= self.volume;
+
+                                    // Has the fade amount dropped below 0?
                                     self.volume -= fade_amount;
                                     if self.volume < 0.0 {
-                                        // We've reached the end, ensure already processed samples  make it
-                                        samples = samples[0..i].to_vec();
-                                        break_playback = true;
-                                        break;
+                                        break 'main Ok(());
                                     }
                                 }
                             } else {
                                 // No fade duration, clear out sample buffer and end.
                                 debug!("Stop Requested, No Fade Out set, Stopping Playback.");
-                                samples = vec![];
-                                break_playback = true;
+                                break 'main Ok(());
                             }
                         }
 
@@ -340,26 +342,48 @@ impl Player {
                             self.progress.store(progress, Ordering::Relaxed);
                         }
 
-                        if let Some(stop_sample) = stop_sample {
-                            if samples_processed >= stop_sample {
-                                break Ok(());
-                            }
+                        if let Some(stop_sample) = stop_sample
+                            && samples_processed >= stop_sample
+                        {
+                            break Ok(());
                         }
 
-                        // If we've been instructed to break, end it here.
-                        if break_playback {
-                            break Ok(());
+                        if self.restart_track.load(Ordering::Relaxed) {
+                            // We've been prompted to restart the current track..
+                            let start_frame = first_frame.unwrap_or_default();
+
+                            let seek_time = SeekTo::TimeStamp {
+                                ts: start_frame,
+                                track_id,
+                            };
+
+                            // Seek the reader backwards to the start..
+                            samples_processed = match reader.seek(SeekMode::Accurate, seek_time) {
+                                Ok(seeked_to) => seeked_to.actual_ts * channels as u64,
+                                Err(e) => {
+                                    debug!("Error Seeking: {}", e);
+                                    0
+                                }
+                            };
+
+                            // Set the back to FALSE
+                            self.restart_track.store(false, Ordering::Relaxed);
                         }
                     }
                 }
                 Err(err) => break Err(err),
             }
         };
-        if !self.force_stop.load(Ordering::Relaxed) {
-            if let Some(mut audio_output) = audio_output {
-                // We should always flush the last samples, unless forced to stop
-                audio_output.flush();
-            }
+        if !self.force_stop.load(Ordering::Relaxed)
+            && let Some(ref mut audio_output) = audio_output
+        {
+            // We should always flush the last samples, unless forced to stop
+            audio_output.flush();
+        }
+
+        // Stop the playback handler..
+        if let Some(mut audio_output) = audio_output {
+            audio_output.stop();
         }
 
         if let Some(ebu_r128) = ebu_r128 {
@@ -389,10 +413,10 @@ impl Player {
         // We're going to suppress that error here, with the assumption that if it's reached, the
         // file has ended, and playback is complete. It's not ideal, but we'll work with it.
         if let Err(error) = result {
-            if let Error::IoError(ref error) = error {
-                if error.kind() == UnexpectedEof {
-                    return Ok(());
-                }
+            if let Error::IoError(ref error) = error
+                && error.kind() == UnexpectedEof
+            {
+                return Ok(());
             }
 
             // Otherwise, throw this error up.
@@ -415,8 +439,10 @@ impl Player {
 
     pub fn get_state(&self) -> PlayerState {
         PlayerState {
+            playing_file: self.file.clone(),
             stopping: self.stopping.clone(),
             force_stop: self.force_stop.clone(),
+            restart_track: self.restart_track.clone(),
             progress: self.progress.clone(),
             error: self.error.clone(),
             calculated_gain: self.normalized_gain.clone(),
@@ -426,8 +452,14 @@ impl Player {
 
 #[derive(Debug)]
 pub struct PlayerState {
+    // Note the file being played..
+    pub playing_file: PathBuf,
+
     pub stopping: Arc<AtomicBool>,
     pub force_stop: Arc<AtomicBool>,
+
+    // This is used for triggering a seek back the the beginning
+    pub restart_track: Arc<AtomicBool>,
 
     // These are generally read only from the outside..
     pub progress: Arc<AtomicU8>,

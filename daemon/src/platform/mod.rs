@@ -1,8 +1,10 @@
-use crate::events::EventTriggers;
 use crate::DaemonState;
+use crate::events::EventTriggers;
 use anyhow::Result;
 use cfg_if::cfg_if;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
+use which::which;
 
 cfg_if! {
     if #[cfg(windows)] {
@@ -27,53 +29,59 @@ cfg_if! {
             windows::remove_startup_link()
         }
 
-        use std::ffi::OsStr;
-        use std::iter::once;
-        use std::os::windows::ffi::OsStrExt;
-        pub fn to_wide(msg: &str) -> Vec<u16> {
-           let wide: Vec<u16> = OsStr::new(msg).encode_wide().chain(once(0)).collect();
-            wide
+        pub fn display_error(message: String) {
+            windows::display_error(message);
         }
     } else if #[cfg(target_os = "linux")] {
         mod linux;
         mod unix;
+
+
         pub fn perform_preflight() -> Result<()> {
             Ok(())
         }
 
         pub async fn spawn_runtime(state: DaemonState, tx: mpsc::Sender<EventTriggers>) -> Result<()> {
+            tokio::spawn(linux::sleep::run(tx.clone(), state.shutdown.clone()));
             unix::spawn_platform_runtime(state, tx).await
         }
 
         pub fn has_autostart() -> bool {
-            linux::has_autostart()
+            linux::autostart::has_autostart()
         }
 
         pub fn set_autostart(enabled: bool) -> Result<()> {
             if enabled {
-                return linux::create_startup_link();
+                return linux::autostart::create_startup_link();
             }
-            linux::remove_startup_link()
+            linux::autostart::remove_startup_link()
+        }
+
+        pub fn display_error(message: String) {
+            linux::display_error(message);
         }
     } else if #[cfg(target_os = "macos")] {
-        mod unix;
-        use anyhow::bail;
+        mod macos;
 
         pub fn perform_preflight() -> Result<()> {
             Ok(())
         }
 
         pub async fn spawn_runtime(state: DaemonState, tx: mpsc::Sender<EventTriggers>) -> Result<()> {
-            unix::spawn_platform_runtime(state, tx).await
+            macos::runtime::run(tx.clone(), state.shutdown.clone()).await
         }
 
         pub fn has_autostart() -> bool {
-            false
+            macos::has_autostart()
         }
 
-        pub fn set_autostart(_enabled: bool) -> Result<()> {
-            bail!("Autostart Not Supported on this Platform");
+        pub fn set_autostart(enabled: bool) -> Result<()> {
+            macos::set_autostart(enabled)
         }
+
+         pub fn display_error(message: String) {
+            macos::display_error(message);
+         }
     } else {
         use anyhow::bail;
 
@@ -92,5 +100,48 @@ cfg_if! {
         pub fn set_autostart(_enabled: bool) -> Result<()> {
             bail!("Autostart Not Supported on this Platform");
         }
+
+        pub fn display_error(message: String) {}
+    }
+}
+
+pub fn get_ui_app_path() -> Option<PathBuf> {
+    // This simply looks for the GoXLR UI App alongside the daemon binary and returns it..
+    let mut path = None;
+    let bin_name = get_ui_binary_name();
+
+    // There are three possible places to check for this, the CWD, the binary WD, and $PATH
+    let cwd = std::env::current_dir().unwrap().join(bin_name.clone());
+    if cwd.exists() {
+        path.replace(cwd);
+    }
+
+    // IntelliJ complains about duplicate code here, and while yes, it's technically duplicated
+    // from goxlr-launcher, the launcher and daemon don't have dependencies on each other.
+    if path.is_none()
+        && let Some(parent) = std::env::current_exe().unwrap().parent()
+    {
+        let bin = parent.join(bin_name.clone());
+        if bin.exists() {
+            path.replace(bin);
+        }
+    }
+
+    if path.is_none() {
+        // Try and locate the binary on $PATH
+        if let Ok(which) = which(bin_name) {
+            path.replace(which);
+        }
+    }
+
+    path
+}
+
+static UI_NAME: &str = "goxlr-utility-ui";
+fn get_ui_binary_name() -> String {
+    if cfg!(windows) {
+        format!("{UI_NAME}.exe")
+    } else {
+        String::from(UI_NAME)
     }
 }

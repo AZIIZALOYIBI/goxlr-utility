@@ -5,13 +5,13 @@ use std::os::raw::c_float;
 use enum_map::{Enum, EnumMap};
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
 
-use anyhow::{anyhow, Result};
-use quick_xml::events::{BytesEnd, BytesStart, Event};
+use anyhow::{Result, anyhow};
 use quick_xml::Writer;
+use quick_xml::events::{BytesEnd, BytesStart, Event};
 
-use crate::components::colours::ColourMap;
-use crate::profile::Attribute;
 use crate::Preset;
+use crate::components::colours::{Colour, ColourMap};
+use crate::profile::Attribute;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -43,9 +43,14 @@ pub struct GenderEncoderBase {
 
 impl GenderEncoderBase {
     pub fn new(element_name: String) -> Self {
-        let colour_map = element_name;
+        let mut colour_map = ColourMap::new(element_name.clone());
+        colour_map.set_colour(0, Colour::fromrgb("00FFFF").unwrap());
+        colour_map.set_colour(1, Colour::fromrgb("00FFFF").unwrap());
+        colour_map.set_colour(2, Colour::fromrgb("00FFFF").unwrap());
+        colour_map.set_colour_group("encoderGroup".to_string());
+
         Self {
-            colour_map: ColourMap::new(colour_map),
+            colour_map,
             preset_map: EnumMap::default(),
             active_set: 0,
         }
@@ -184,12 +189,12 @@ impl GenderEncoder {
 
     pub fn amount(&self) -> i8 {
         // Amount is dependent on Style, and knob position, lets work with positive numbers.
-        let knob_position = (self.knob_position + 24) as i32; // Between 0 and 48..
+        let knob_position = self.knob_position as f32; // Between -24 and 24..
 
         match self.style {
-            GenderStyle::Narrow => ((24 * knob_position) / 48 - 12) as i8,
-            GenderStyle::Medium => ((50 * knob_position) / 48 - 25) as i8,
-            GenderStyle::Wide => ((100 * knob_position) / 48 - 50) as i8,
+            GenderStyle::Narrow => ((12. * knob_position) / 24.).round() as i8,
+            GenderStyle::Medium => ((25. * knob_position) / 24.).round() as i8,
+            GenderStyle::Wide => ((50. * knob_position) / 24.).round() as i8,
         }
     }
 

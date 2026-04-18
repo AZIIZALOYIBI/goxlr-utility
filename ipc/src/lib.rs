@@ -1,5 +1,7 @@
+use enum_map::Enum;
 use json_patch::Patch;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub mod client;
 pub mod clients;
@@ -8,13 +10,13 @@ mod device;
 pub use device::*;
 use goxlr_types::{
     AnimationMode, Button, ButtonColourGroups, ButtonColourOffStyle, ChannelName,
-    CompressorAttackTime, CompressorRatio, CompressorReleaseTime, DisplayMode,
+    CompressorAttackTime, CompressorRatio, CompressorReleaseTime, DeviceType, DisplayMode,
     DisplayModeComponents, EchoStyle, EffectBankPresets, EncoderColourTargets, EqFrequencies,
     FaderDisplayStyle, FaderName, GateTimes, GenderStyle, HardTuneSource, HardTuneStyle,
     InputDevice, MegaphoneStyle, MicrophoneType, MiniEqFrequencies, Mix, MuteFunction, MuteState,
     OutputDevice, PitchStyle, ReverbStyle, RobotRange, RobotStyle, SampleBank, SampleButtons,
-    SamplePlayOrder, SamplePlaybackMode, SamplerColourTargets, SimpleColourTargets,
-    WaterfallDirection,
+    SamplePlayOrder, SamplePlaybackMode, SamplerColourTargets, SimpleColourTargets, VersionNumber,
+    VodMode, WaterfallDirection,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,13 +24,19 @@ pub enum DaemonRequest {
     Ping,
     GetStatus,
     Daemon(DaemonCommand),
+    GetMicLevel(String),
     Command(String, GoXLRCommand),
+    RunFirmwareUpdate(String, Option<PathBuf>, bool),
+    ContinueFirmwareUpdate(String),
+    ClearFirmwareState(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum DaemonResponse {
     Ok,
     Error(String),
+    MicLevel(f64),
     Status(DaemonStatus),
     Patch(Patch),
 }
@@ -46,6 +54,12 @@ pub struct WebsocketResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub enum ColourWay {
+    Black,
+    White,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum PathTypes {
     Profiles,
     MicProfiles,
@@ -53,6 +67,37 @@ pub enum PathTypes {
     Samples,
     Icons,
     Logs,
+    Backups,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub enum UpdateState {
+    Failed,
+
+    Starting,
+    Manifest,
+    Download,
+    Pause(FirmwareInfo),
+    ClearNVR,
+    UploadFirmware,
+    ValidateUpload,
+    HardwareValidate,
+    HardwareWrite,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct FirmwareInfo {
+    pub path: PathBuf,
+    pub device_type: DeviceType,
+    pub version: VersionNumber,
+}
+
+#[derive(Debug, Copy, Clone, Default, Enum, Serialize, Deserialize, Eq, PartialEq)]
+pub enum FirmwareSource {
+    #[default]
+    Live,
+    Beta,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -73,16 +118,27 @@ pub enum DaemonCommand {
     StopDaemon,
     OpenPath(PathTypes),
     SetLogLevel(LogLevel),
+    SetFirmwareSource(FirmwareSource),
     SetShowTrayIcon(bool),
+    SetLocale(Option<String>),
     SetTTSEnabled(bool),
     SetAutoStartEnabled(bool),
     SetAllowNetworkAccess(bool),
+    SetUiLaunchOnLoad(bool),
     RecoverDefaults(PathTypes),
+    SetActivatorPath(Option<PathBuf>),
+
+    SetSampleGainPct(String, u8),
+    ApplySampleChange,
+
+    HandleMacOSAggregates(bool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GoXLRCommand {
     SetShutdownCommands(Vec<GoXLRCommand>),
+    SetSleepCommands(Vec<GoXLRCommand>),
+    SetWakeCommands(Vec<GoXLRCommand>),
     SetSamplerPreBufferDuration(u16),
 
     SetFader(FaderName, ChannelName),
@@ -236,6 +292,7 @@ pub enum GoXLRCommand {
     SaveProfile(),
     SaveProfileAs(String),
     DeleteProfile(String),
+    ReloadSettings(),
 
     NewMicProfile(String),
     LoadMicProfile(String, bool),
@@ -247,6 +304,10 @@ pub enum GoXLRCommand {
     SetMuteHoldDuration(u16),
     SetVCMuteAlsoMuteCM(bool),
     SetMonitorWithFx(bool),
+    SetSamplerResetOnClear(bool),
+    SetSamplerFadeDuration(u32),
+    SetLockFaders(bool),
+    SetVodMode(VodMode),
 
     // These control the current GoXLR 'State'..
     SetActiveEffectPreset(EffectBankPresets),

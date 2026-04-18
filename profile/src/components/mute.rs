@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use enum_map_derive::Enum;
-use strum::{EnumIter, EnumProperty, IntoEnumIterator};
+use strum::{Display, EnumIter, EnumProperty, IntoEnumIterator};
 
 use anyhow::Result;
-use quick_xml::events::{BytesStart, Event};
+use log::warn;
 use quick_xml::Writer;
+use quick_xml::events::{BytesStart, Event};
 
-use crate::components::colours::ColourMap;
+use crate::Faders;
+use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::profile::Attribute;
 
 #[derive(thiserror::Error, Debug)]
@@ -39,12 +41,22 @@ pub struct MuteButton {
 }
 
 impl MuteButton {
-    pub fn new(id: u8) -> Self {
-        let colour_prefix = format!("mute{id}");
+    pub fn new(fader: Faders) -> Self {
+        let context = fader.get_str("muteContext").unwrap();
+
+        let mut colour_map = ColourMap::new(context.to_string());
+        colour_map.set_off_style(ColourOffStyle::Dimmed);
+        colour_map.set_blink_on(false);
+        colour_map.set_state_on(false);
+        colour_map.set_colour(0, Colour::fromrgb("00FFFF").unwrap());
+        colour_map.set_colour(1, Colour::fromrgb("000000").unwrap());
+        colour_map.set_colour_group("muteGroup".to_string());
+
         Self {
-            colour_map: ColourMap::new(colour_prefix),
+            colour_map,
             mute_function: MuteFunction::All,
             previous_volume: 0,
+
             from_mute_all: None,
         }
     }
@@ -60,15 +72,24 @@ impl MuteButton {
                     continue;
                 }
 
+                // Legacy values from GoXLR App 1.3 and Pre-Mix 2
+                let value = if attr.value == "Mute to Chat Mic" {
+                    String::from("Mute to Voice Chat")
+                } else if attr.value == "Mute to Stream" {
+                    String::from("Mute to Stream 1")
+                } else {
+                    attr.value.clone()
+                };
+
                 for function in MuteFunction::iter() {
-                    if function.get_str("Value").unwrap() == attr.value {
+                    if function.get_str("Value").unwrap() == value {
                         self.mute_function = function;
                         found = true;
                         break;
                     }
                 }
                 if !found {
-                    println!("Couldn't find Mute Function: {}", attr.value);
+                    warn!("Couldn't find Mute Function: {}", value);
                 }
                 continue;
             }
@@ -98,18 +119,17 @@ impl MuteButton {
         Ok(())
     }
 
-    pub fn write_button<W: Write>(
-        &self,
-        element_name: String,
-        writer: &mut Writer<W>,
-    ) -> Result<()> {
-        let mut elem = BytesStart::new(element_name.as_str());
+    pub fn write_button<W: Write>(&self, writer: &mut Writer<W>, fader: Faders) -> Result<()> {
+        let element_name = fader.get_str("muteContext").unwrap();
+        let mut elem = BytesStart::new(element_name);
 
         let mut attributes: HashMap<String, String> = HashMap::default();
-        attributes.insert(
-            format!("{element_name}Function"),
-            self.mute_function.get_str("Value").unwrap().to_string(),
-        );
+        let mute_value = if self.mute_function == MuteFunction::ToVoiceChat {
+            String::from("Mute to Chat Mic")
+        } else {
+            self.mute_function.get_str("Value").unwrap().to_string()
+        };
+        attributes.insert(format!("{element_name}Function"), mute_value);
         attributes.insert(
             format!("{element_name}prevLevel"),
             format!("{}", self.previous_volume),
@@ -123,7 +143,7 @@ impl MuteButton {
         }
 
         self.colour_map
-            .write_colours_with_prefix(element_name.clone(), &mut attributes);
+            .write_colours_with_prefix(element_name.into(), &mut attributes);
 
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
@@ -157,12 +177,12 @@ impl MuteButton {
 }
 
 // MuteChat
-#[derive(Debug, Copy, Clone, Enum, EnumProperty, EnumIter, PartialEq, Eq)]
+#[derive(Debug, Display, Copy, Clone, Enum, EnumProperty, EnumIter, PartialEq, Eq)]
 pub enum MuteFunction {
     #[strum(props(Value = "Mute All", uiIndex = "0"))]
     All,
 
-    #[strum(props(Value = "Mute to Stream", uiIndex = "1"))]
+    #[strum(props(Value = "Mute to Stream 1", uiIndex = "1"))]
     ToStream,
 
     #[strum(props(Value = "Mute to Voice Chat", uiIndex = "2"))]
@@ -173,4 +193,10 @@ pub enum MuteFunction {
 
     #[strum(props(Value = "Mute to Line Out", uiIndex = "4"))]
     ToLineOut,
+
+    #[strum(props(Value = "Mute to Stream 2", uiIndex = "5"))]
+    ToStream2,
+
+    #[strum(props(Value = "Mute to Streams 1 + 2", uiIndex = "6"))]
+    ToStreams,
 }

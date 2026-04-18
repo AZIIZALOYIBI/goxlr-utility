@@ -3,10 +3,12 @@ use std::io::Write;
 use std::str::FromStr;
 
 use anyhow::Result;
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesStart, Event};
+use strum::EnumProperty;
 
-use crate::components::colours::ColourMap;
+use crate::Faders;
+use crate::components::colours::{Colour, ColourMap};
 use crate::components::scribble::ScribbleStyle::{Inverted, Normal};
 use crate::profile::Attribute;
 
@@ -28,7 +30,6 @@ pub enum ParseError {
 
 #[derive(Debug)]
 pub struct Scribble {
-    element_name: String,
     colour_map: ColourMap,
 
     // File provided to the GoXLR to handle (no path, just the filename)
@@ -59,15 +60,23 @@ pub struct Scribble {
 }
 
 impl Scribble {
-    pub fn new(id: u8) -> Self {
-        let element_name = format!("scribble{id}");
-        let colour_map = format!("scribble{id}");
+    pub fn new(fader: Faders) -> Self {
+        let element_name = fader.get_str("scribbleContext").unwrap();
+        let mut colour_map = ColourMap::new(element_name.to_string());
+        colour_map.set_colour(0, Colour::fromrgb("00FFFF").unwrap());
+
+        let text = match fader {
+            Faders::A => "Mic",
+            Faders::B => "Music",
+            Faders::C => "Chat",
+            Faders::D => "System",
+        };
+
         Self {
-            element_name,
-            colour_map: ColourMap::new(colour_map),
+            colour_map,
             icon_file: None,
             text_top_left: "".to_string(),
-            text_bottom_middle: "".to_string(),
+            text_bottom_middle: text.to_string(),
             text_size: 0,
             alpha: 0.0,
             style: Normal,
@@ -87,12 +96,12 @@ impl Scribble {
             }
 
             if attr.name.ends_with("string0") {
-                self.text_top_left = attr.value.clone();
+                self.text_top_left.clone_from(&attr.value);
                 continue;
             }
 
             if attr.name.ends_with("string1") {
-                self.text_bottom_middle = attr.value.clone();
+                self.text_bottom_middle.clone_from(&attr.value);
                 continue;
             }
 
@@ -116,7 +125,7 @@ impl Scribble {
             }
 
             if attr.name.ends_with("bitmap") {
-                self.bitmap_file = attr.value.clone();
+                self.bitmap_file.clone_from(&attr.value);
                 continue;
             }
 
@@ -129,46 +138,37 @@ impl Scribble {
         Ok(())
     }
 
-    pub fn write_scribble<W: Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-        let mut elem = BytesStart::new(self.element_name.as_str());
+    pub fn write_scribble<W: Write>(&self, writer: &mut Writer<W>, fader: Faders) -> Result<()> {
+        let element_name = fader.get_str("scribbleContext").unwrap();
+        let mut elem = BytesStart::new(element_name);
 
         let mut attributes: HashMap<String, String> = HashMap::default();
         attributes.insert(
-            format!("{}iconFile", self.element_name),
+            format!("{element_name}iconFile"),
             if self.icon_file.is_none() {
                 "".to_string()
             } else {
                 self.icon_file.clone().unwrap()
             },
         );
+        attributes.insert(format!("{element_name}string0"), self.text_top_left.clone());
         attributes.insert(
-            format!("{}string0", self.element_name),
-            self.text_top_left.clone(),
-        );
-        attributes.insert(
-            format!("{}string1", self.element_name),
+            format!("{element_name}string1"),
             self.text_bottom_middle.clone(),
         );
+        attributes.insert(format!("{element_name}alpha"), format!("{}", self.alpha));
         attributes.insert(
-            format!("{}alpha", self.element_name),
-            format!("{}", self.alpha),
+            format!("{element_name}inverted"),
+            if self.style == Normal { "0" } else { "1" }.parse()?,
         );
         attributes.insert(
-            format!("{}inverted", self.element_name),
-            if self.style == Normal { "0" } else { "1" }
-                .parse()
-                .unwrap(),
-        );
-        attributes.insert(
-            format!("{}textSize", self.element_name),
+            format!("{element_name}textSize"),
             format!("{}", self.text_size),
         );
-        attributes.insert(
-            format!("{}bitmap", self.element_name),
-            self.bitmap_file.clone(),
-        );
+        attributes.insert(format!("{element_name}bitmap"), self.bitmap_file.clone());
 
-        self.colour_map.write_colours(&mut attributes);
+        self.colour_map
+            .write_colours_with_prefix(element_name.into(), &mut attributes);
 
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));

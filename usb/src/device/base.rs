@@ -8,14 +8,13 @@ use crate::commands::{
 };
 use crate::dcp::DCPCategory;
 use crate::routing::InputDevice;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use enumset::EnumSet;
 use goxlr_types::{
     ChannelName, EffectKey, EncoderName, FaderName, FirmwareVersions, MicrophoneParamKey,
     MicrophoneType, Mix, SubMixChannelName, VersionNumber,
 };
-use log::debug;
 use std::io::{Cursor, Write};
 use tokio::sync::mpsc::Sender;
 
@@ -34,7 +33,7 @@ pub trait AttachGoXLR {
 
     fn set_unique_identifier(&mut self, identifier: String);
     fn is_connected(&mut self) -> bool;
-    fn stop_polling(&mut self);
+    fn set_is_polling(&mut self, polling: bool);
 }
 
 pub trait ExecutableGoXLR {
@@ -67,15 +66,14 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             Command::GetHardwareInfo(HardwareInfoCommand::FirmwareVersion),
             &[],
         )?;
-        debug!("{:x?}", result);
         let mut cursor = Cursor::new(result);
         let firmware_packed = cursor.read_u32::<LittleEndian>()?;
         let firmware_build = cursor.read_u32::<LittleEndian>()?;
         let firmware = VersionNumber(
             firmware_packed >> 12,
             (firmware_packed >> 8) & 0xF,
-            firmware_packed & 0xFF,
-            firmware_build,
+            Some(firmware_packed & 0xFF),
+            Some(firmware_build),
         );
 
         let _unknown = cursor.read_u32::<LittleEndian>()?;
@@ -86,8 +84,8 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         let dice = VersionNumber(
             (dice_packed >> 20) & 0xF,
             (dice_packed >> 12) & 0xFF,
-            dice_packed & 0xFFF,
-            dice_build,
+            Some(dice_packed & 0xFFF),
+            Some(dice_build),
         );
 
         Ok(FirmwareVersions {
@@ -185,7 +183,8 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         Ok(())
     }
 
-    fn set_routing(&mut self, input_device: InputDevice, data: [u8; 22]) -> Result<()> {
+    // This is kinda ugly now, we have to assume the caller knows what they're doing..
+    fn set_routing(&mut self, input_device: InputDevice, data: Vec<u8>) -> Result<()> {
         self.request_data(Command::SetRouting(input_device), &data)?;
         Ok(())
     }
@@ -197,7 +196,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
     }
 
     // TODO: Potentially for later, abstract out the 'data' section into a couple of Vec<>s
-    fn set_channel_mixes(&mut self, data: [u8; 8]) -> Result<()> {
+    fn set_channel_mixes(&mut self, data: Vec<u8>) -> Result<()> {
         self.request_data(Command::SetChannelMixes, &data)?;
         Ok(())
     }

@@ -1,17 +1,19 @@
+use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{anyhow, bail, Result};
-use enum_map::EnumMap;
+use anyhow::{Context as ErrorContext, Result, anyhow, bail};
+use enum_map::{EnumMap, enum_map};
 use log::{debug, warn};
 use quick_xml::events::{BytesDecl, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 use strum::EnumProperty;
 use strum::IntoEnumIterator;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 
+use crate::SampleButtons::{BottomLeft, BottomRight, Clear, TopLeft, TopRight};
 use crate::components::animation::AnimationTree;
 use crate::components::browser::BrowserPreviewTree;
 use crate::components::context::Context;
@@ -34,7 +36,6 @@ use crate::components::scribble::Scribble;
 use crate::components::simple::{SimpleElement, SimpleElements};
 use crate::components::submix::mix_routing_tree::{Mix, MixRoutingTree};
 use crate::components::submix::submixer::SubMixer;
-use crate::SampleButtons::{BottomLeft, BottomRight, Clear, TopLeft, TopRight};
 use crate::{Faders, Preset, SampleButtons};
 
 #[derive(Debug)]
@@ -82,13 +83,21 @@ impl Profile {
 
     // Ok, this is better.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        debug!("Saving File: {}", &path.as_ref().to_string_lossy());
+        let mut tmp_file_name = path.as_ref().to_path_buf();
+        tmp_file_name.set_extension("tmp");
+        if tmp_file_name.exists() {
+            debug!("Temporary file already exists? Removing.");
+            fs::remove_file(&tmp_file_name)?;
+        }
+
+        debug!("Creating Temporary Save File: {:?}", &tmp_file_name);
+        let temp_file = File::create(&tmp_file_name)?;
 
         // Create a new ZipFile at the requested location
-        let mut archive = zip::ZipWriter::new(File::create(path.as_ref())?);
+        let mut archive = zip::ZipWriter::new(&temp_file);
 
         // Store the profile..
-        archive.start_file("profile.xml", FileOptions::default())?;
+        archive.start_file("profile.xml", SimpleFileOptions::default())?;
         self.settings.write_to(&mut archive)?;
 
         // Write the scribbles..
@@ -96,12 +105,26 @@ impl Profile {
             // Only write if there's actually data stored..
             if !self.scribbles[i].is_empty() {
                 let filename = format!("scribble{}.png", i + 1);
-                archive.start_file(filename, FileOptions::default())?;
+                archive.start_file(filename, SimpleFileOptions::default())?;
                 archive.write_all(scribble)?;
             }
         }
         archive.finish()?;
 
+        // The archive has finished writing, we don't need it anymore (keeping it live prevents
+        // us from removing the temporary file).
+        temp_file.sync_all()?;
+
+        // Once complete, we simply move the file over the existing file..
+        debug!("Save Complete and synced, renaming to {:?}", path.as_ref());
+        if path.as_ref().exists() {
+            debug!("Target profile exists, removing..");
+            fs::remove_file(&path).unwrap_or_else(|e| {
+                warn!("Error Removing File: {}", e);
+            });
+        }
+        debug!("Renaming {:?} to {:?}", tmp_file_name, path.as_ref());
+        fs::rename(tmp_file_name, &path)?;
         Ok(())
     }
 
@@ -133,12 +156,15 @@ pub struct ProfileSettings {
     mixer: Mixers,
     context: Context,
     mute_chat: MuteChat,
-    mute_buttons: EnumMap<Faders, Option<MuteButton>>,
-    faders: EnumMap<Faders, Option<Fader>>,
-    effects: EnumMap<Preset, Option<Effects>>,
-    scribbles: EnumMap<Faders, Option<Scribble>>,
-    sampler_map: EnumMap<SampleButtons, Option<SampleBase>>,
-    simple_elements: EnumMap<SimpleElements, Option<SimpleElement>>,
+
+    faders: EnumMap<Faders, Fader>,
+    mute_buttons: EnumMap<Faders, MuteButton>,
+    scribbles: EnumMap<Faders, Scribble>,
+
+    sampler_map: EnumMap<SampleButtons, SampleBase>,
+    simple_elements: EnumMap<SimpleElements, SimpleElement>,
+
+    effects: EnumMap<Preset, Effects>,
     megaphone_effect: MegaphoneEffectBase,
     robot_effect: RobotEffectBase,
     hardtune_effect: HardtuneEffectBase,
@@ -168,14 +194,48 @@ impl ProfileSettings {
         let mut context = Context::new("selectedContext".to_string());
         let mut mute_chat = MuteChat::new("muteChat".to_string());
 
-        let mut mute_buttons: EnumMap<Faders, Option<MuteButton>> = EnumMap::default();
-        let mut faders: EnumMap<Faders, Option<Fader>> = EnumMap::default();
-        let mut scribbles: EnumMap<Faders, Option<Scribble>> = EnumMap::default();
+        let mut faders = enum_map! {
+            Faders::A => Fader::new(Faders::A),
+            Faders::B => Fader::new(Faders::B),
+            Faders::C => Fader::new(Faders::C),
+            Faders::D => Fader::new(Faders::D),
+        };
 
-        let mut effects: EnumMap<Preset, Option<Effects>> = EnumMap::default();
+        let mut mute_buttons = enum_map! {
+            Faders::A => MuteButton::new(Faders::A),
+            Faders::B => MuteButton::new(Faders::B),
+            Faders::C => MuteButton::new(Faders::C),
+            Faders::D => MuteButton::new(Faders::D),
+        };
 
-        let mut simple_elements: EnumMap<SimpleElements, Option<SimpleElement>> =
-            Default::default();
+        // Create Defaults For the Scribbles..
+        let mut scribbles = enum_map! {
+            Faders::A => Scribble::new(Faders::A),
+            Faders::B => Scribble::new(Faders::B),
+            Faders::C => Scribble::new(Faders::C),
+            Faders::D => Scribble::new(Faders::D)
+        };
+
+        let mut effects = enum_map! {
+            Preset::Preset1 => Effects::new(Preset::Preset1),
+            Preset::Preset2 => Effects::new(Preset::Preset2),
+            Preset::Preset3 => Effects::new(Preset::Preset3),
+            Preset::Preset4 => Effects::new(Preset::Preset4),
+            Preset::Preset5 => Effects::new(Preset::Preset5),
+            Preset::Preset6 => Effects::new(Preset::Preset6),
+        };
+
+        let mut simple_elements = enum_map! {
+            SimpleElements::SampleBankA => SimpleElement::new(SimpleElements::SampleBankA),
+            SimpleElements::SampleBankB => SimpleElement::new(SimpleElements::SampleBankB),
+            SimpleElements::SampleBankC => SimpleElement::new(SimpleElements::SampleBankC),
+            SimpleElements::FxClear => SimpleElement::new(SimpleElements::FxClear),
+            SimpleElements::Swear => SimpleElement::new(SimpleElements::Swear),
+            SimpleElements::GlobalColour => SimpleElement::new(SimpleElements::GlobalColour),
+            SimpleElements::LogoX => SimpleElement::new(SimpleElements::LogoX),
+        };
+
+        //let mut simple: EnumMap<SimpleElements, Option<SimpleElement>> = Default::default();
 
         let mut megaphone_effect = MegaphoneEffectBase::new("megaphoneEffect".to_string());
         let mut robot_effect = RobotEffectBase::new("robotEffect".to_string());
@@ -185,7 +245,15 @@ impl ProfileSettings {
         let mut pitch_encoder = PitchEncoderBase::new("pitchEncoder".to_string());
         let mut gender_encoder = GenderEncoderBase::new("genderEncoder".to_string());
 
-        let mut sampler_map: EnumMap<SampleButtons, Option<SampleBase>> = EnumMap::default();
+        let mut sampler_map = enum_map! {
+            TopLeft => SampleBase::new(TopLeft),
+            TopRight => SampleBase::new(TopRight),
+            BottomLeft => SampleBase::new(BottomLeft),
+            BottomRight => SampleBase::new(BottomRight),
+            Clear => SampleBase::new(Clear),
+        };
+
+        // This value isn't stored in the struct.
         let mut active_sample_button: Option<&mut SampleBase> = None;
 
         let mut buf = Vec::new();
@@ -234,127 +302,103 @@ impl ProfileSettings {
                         continue;
                     }
 
-                    // Might need to pattern match this..
-                    if name.starts_with("mute") && name != "muteChat" {
-                        // In the XML, the count starts as 1, here, we're gonna store as 0.
-                        if let Some(id) = name
-                            .chars()
-                            .last()
-                            .map(|s| u8::from_str(&s.to_string()))
-                            .transpose()?
-                        {
-                            let mut mute_button = MuteButton::new(id);
-                            mute_button.parse_button(&attributes)?;
-                            mute_buttons[Faders::iter().nth((id - 1).into()).unwrap()] =
-                                Some(mute_button);
-                            continue;
-                        }
-                    }
-
                     if name.starts_with("FaderMeter") {
-                        // In the XML, the count starts at 0, and we have different capitalisation :D
-                        if let Some(id) = name
-                            .chars()
-                            .last()
-                            .map(|s| u8::from_str(&s.to_string()))
-                            .transpose()?
-                        {
-                            let mut fader = Fader::new(id);
-                            fader.parse_fader(&attributes)?;
-                            faders[Faders::iter().nth(id.into()).unwrap()] = Some(fader);
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("effects") {
-                        let mut found = false;
-
-                        // Version 2, now with more enum, search for the prefix..
-                        for preset in Preset::iter() {
-                            if preset.get_str("contextTitle").unwrap() == name {
-                                let mut effect = Effects::new(preset);
-                                effect.parse_effect(&attributes)?;
-                                effects[preset] = Some(effect);
-                                found = true;
+                        for fader in Faders::iter() {
+                            if fader.get_str("faderContext").unwrap() == name {
+                                faders[fader].parse_fader(&attributes)?;
                                 break;
                             }
                         }
-                        if found {
-                            continue;
+                        continue;
+                    }
+
+                    // Might need to pattern match this..
+                    if name.starts_with("mute") && name != "muteChat" {
+                        for fader in Faders::iter() {
+                            if fader.get_str("muteContext").unwrap() == name {
+                                mute_buttons[fader].parse_button(&attributes)?;
+                                break;
+                            }
                         }
+                        continue;
                     }
 
                     if name.starts_with("scribble") {
-                        if let Some(id) = name
-                            .chars()
-                            .last()
-                            .map(|s| u8::from_str(&s.to_string()))
-                            .transpose()?
-                        {
-                            let mut scribble = Scribble::new(id);
-                            scribble.parse_scribble(&attributes)?;
-                            scribbles[Faders::iter().nth((id - 1).into()).unwrap()] =
-                                Some(scribble);
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("megaphoneEffectpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            megaphone_effect.parse_megaphone_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("robotEffectpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            robot_effect.parse_robot_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("hardtuneEffectpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            hardtune_effect.parse_hardtune_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("reverbEncoderpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            reverb_encoder.parse_reverb_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("echoEncoderpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            echo_encoder.parse_echo_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("pitchEncoderpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            pitch_encoder.parse_pitch_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("genderEncoderpreset") {
-                        if let Ok(preset) = ProfileSettings::parse_preset(name.clone()) {
-                            gender_encoder.parse_gender_preset(preset, &attributes)?;
-                            continue;
-                        }
-                    }
-
-                    if name.starts_with("sampleStack") {
-                        if let Some(id) = name.chars().last() {
-                            if let Some(button) = &mut active_sample_button {
-                                button.parse_sample_stack(id, &attributes)?;
-                                continue;
+                        for fader in Faders::iter() {
+                            if fader.get_str("scribbleContext").unwrap() == name {
+                                scribbles[fader].parse_scribble(&attributes)?;
+                                break;
                             }
                         }
+
+                        continue;
+                    }
+
+                    if name.starts_with("effects") {
+                        for preset in Preset::iter() {
+                            if preset.get_str("contextTitle").unwrap() == name {
+                                effects[preset].parse_effect(&attributes)?;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if name.starts_with("megaphoneEffectpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        megaphone_effect.parse_megaphone_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("robotEffectpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        robot_effect.parse_robot_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("hardtuneEffectpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        hardtune_effect.parse_hardtune_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("reverbEncoderpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        reverb_encoder.parse_reverb_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("echoEncoderpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        echo_encoder.parse_echo_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("pitchEncoderpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        pitch_encoder.parse_pitch_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("genderEncoderpreset")
+                        && let Ok(preset) = ProfileSettings::parse_preset(name.clone())
+                    {
+                        gender_encoder.parse_gender_preset(preset, &attributes)?;
+                        continue;
+                    }
+
+                    if name.starts_with("sampleStack")
+                        && let Some(id) = name.chars().last()
+                        && let Some(button) = &mut active_sample_button
+                    {
+                        button.parse_sample_stack(id, &attributes)?;
+                        continue;
                     }
 
                     if name.starts_with("sampleBank")
@@ -364,9 +408,8 @@ impl ProfileSettings {
                         || name == "logoX"
                     {
                         // In this case, the tag name, and attribute prefixes are the same..
-                        let mut simple_element = SimpleElement::new(name.clone());
-                        simple_element.parse_simple(&attributes)?;
-                        simple_elements[SimpleElements::from_str(&name)?] = Some(simple_element);
+                        let element = SimpleElements::from_str(&name)?;
+                        simple_elements[element].parse_simple(&attributes)?;
 
                         continue;
                     }
@@ -436,42 +479,32 @@ impl ProfileSettings {
 
                     // These can probably be a little cleaner..
                     if name == "sampleTopLeft" {
-                        let mut sampler = SampleBase::new("sampleTopLeft".to_string());
-                        sampler.parse_sample_root(&attributes)?;
-                        sampler_map[TopLeft] = Some(sampler);
-                        active_sample_button = sampler_map[TopLeft].as_mut();
+                        sampler_map[TopLeft].parse_sample_root(&attributes)?;
+                        active_sample_button = Some(&mut sampler_map[TopLeft]);
                         continue;
                     }
 
                     if name == "sampleTopRight" {
-                        let mut sampler = SampleBase::new("sampleTopRight".to_string());
-                        sampler.parse_sample_root(&attributes)?;
-                        sampler_map[TopRight] = Some(sampler);
-                        active_sample_button = sampler_map[TopRight].as_mut();
+                        sampler_map[TopRight].parse_sample_root(&attributes)?;
+                        active_sample_button = Some(&mut sampler_map[TopRight]);
                         continue;
                     }
 
                     if name == "sampleBottomLeft" {
-                        let mut sampler = SampleBase::new("sampleBottomLeft".to_string());
-                        sampler.parse_sample_root(&attributes)?;
-                        sampler_map[BottomLeft] = Some(sampler);
-                        active_sample_button = sampler_map[BottomLeft].as_mut();
+                        sampler_map[BottomLeft].parse_sample_root(&attributes)?;
+                        active_sample_button = Some(&mut sampler_map[BottomLeft]);
                         continue;
                     }
 
                     if name == "sampleBottomRight" {
-                        let mut sampler = SampleBase::new("sampleBottomRight".to_string());
-                        sampler.parse_sample_root(&attributes)?;
-                        sampler_map[BottomRight] = Some(sampler);
-                        active_sample_button = sampler_map[BottomRight].as_mut();
+                        sampler_map[BottomRight].parse_sample_root(&attributes)?;
+                        active_sample_button = Some(&mut sampler_map[BottomRight]);
                         continue;
                     }
 
                     if name == "sampleClear" {
-                        let mut sampler = SampleBase::new("sampleClear".to_string());
-                        sampler.parse_sample_root(&attributes)?;
-                        sampler_map[Clear] = Some(sampler);
-                        active_sample_button = sampler_map[Clear].as_mut();
+                        sampler_map[Clear].parse_sample_root(&attributes)?;
+                        active_sample_button = Some(&mut sampler_map[Clear]);
                         continue;
                     }
                 }
@@ -500,10 +533,10 @@ impl ProfileSettings {
             mixer,
             context,
             mute_chat,
-            mute_buttons,
             faders,
-            effects,
+            mute_buttons,
             scribbles,
+            effects,
             sampler_map,
             simple_elements,
             megaphone_effect,
@@ -632,30 +665,23 @@ impl ProfileSettings {
 
         self.mute_chat.write_mute_chat(&mut writer)?;
 
-        for (faders, mute_button) in self.mute_buttons.iter() {
-            if let Some(mute_button) = mute_button {
-                let name = format!("mute{}", (faders as u8) + 1);
-                mute_button.write_button(name, &mut writer)?;
-            }
+        // The following three iters need the FaderName to be defined and passed
+        // forward, the tag names need to be dynamically generated to prevent breakage
+        // when .swap() is used to move them around.
+        for (faders, fader) in &self.faders {
+            fader.write_fader(&mut writer, faders)?;
         }
 
-        for (faders, fader) in self.faders.iter() {
-            if let Some(fader) = fader {
-                let name = format!("FaderMeter{}", faders as u8);
-                fader.write_fader(name, &mut writer)?;
-            }
+        for (fader, button) in &self.mute_buttons {
+            button.write_button(&mut writer, fader)?;
         }
 
-        for (_key, value) in &self.effects {
-            if let Some(value) = value {
-                value.write_effects(&mut writer)?;
-            }
+        for (fader, scribble) in &self.scribbles {
+            scribble.write_scribble(&mut writer, fader)?;
         }
 
-        for (_fader, scribble) in self.scribbles.iter() {
-            if let Some(scribble) = scribble {
-                scribble.write_scribble(&mut writer)?;
-            }
+        for effect in self.effects.values() {
+            effect.write_effects(&mut writer)?;
         }
 
         self.megaphone_effect.write_megaphone(&mut writer)?;
@@ -667,17 +693,12 @@ impl ProfileSettings {
         self.pitch_encoder.write_pitch(&mut writer)?;
         self.gender_encoder.write_gender(&mut writer)?;
 
-        for (_key, value) in &self.sampler_map {
-            if let Some(value) = value {
-                value.write_sample(&mut writer)?;
-            }
+        for sampler in self.sampler_map.values() {
+            sampler.write_sample(&mut writer)?;
         }
 
-        for simple_element in SimpleElements::iter() {
-            self.simple_elements[simple_element]
-                .as_ref()
-                .unwrap()
-                .write_simple(&mut writer)?;
+        for element in self.simple_elements.values() {
+            element.write_simple(&mut writer)?;
         }
 
         // Finalise the XML..
@@ -702,7 +723,8 @@ impl ProfileSettings {
 
     pub fn write_preset<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let out_file = File::create(path)?;
-        self.write_preset_to(out_file)
+        self.write_preset_to(&out_file)?;
+        out_file.sync_all().context("Unable to Sync File")
     }
 
     pub fn write_preset_to<W: Write>(&self, sink: W) -> Result<()> {
@@ -764,10 +786,9 @@ impl ProfileSettings {
             .last()
             .map(|s| u8::from_str(&s.to_string()))
             .transpose()?
+            && let Some(preset) = Preset::iter().nth((id - 1) as usize)
         {
-            if let Some(preset) = Preset::iter().nth((id - 1) as usize) {
-                return Ok(preset);
-            }
+            return Ok(preset);
         }
         Err(anyhow!("Unable to Parse Preset from Number"))
     }
@@ -788,48 +809,48 @@ impl ProfileSettings {
         &self.mixer
     }
 
-    pub fn faders_mut(&mut self) -> &mut EnumMap<Faders, Option<Fader>> {
+    pub fn faders_mut(&mut self) -> &mut EnumMap<Faders, Fader> {
         &mut self.faders
     }
 
     pub fn fader_mut(&mut self, fader: Faders) -> &mut Fader {
-        self.faders[fader].as_mut().unwrap()
+        &mut self.faders[fader]
     }
 
     pub fn fader(&self, fader: Faders) -> &Fader {
-        self.faders[fader].as_ref().unwrap()
+        &self.faders[fader]
     }
 
-    pub fn mute_buttons(&mut self) -> &mut EnumMap<Faders, Option<MuteButton>> {
+    pub fn mute_buttons(&mut self) -> &mut EnumMap<Faders, MuteButton> {
         &mut self.mute_buttons
     }
 
     pub fn mute_button_mut(&mut self, fader: Faders) -> &mut MuteButton {
-        self.mute_buttons[fader].as_mut().unwrap()
+        &mut self.mute_buttons[fader]
     }
 
     pub fn mute_button(&self, fader: Faders) -> &MuteButton {
-        self.mute_buttons[fader].as_ref().unwrap()
+        &self.mute_buttons[fader]
     }
 
-    pub fn scribbles_mut(&mut self) -> &mut EnumMap<Faders, Option<Scribble>> {
+    pub fn scribbles_mut(&mut self) -> &mut EnumMap<Faders, Scribble> {
         &mut self.scribbles
     }
 
     pub fn scribble(&self, fader: Faders) -> &Scribble {
-        self.scribbles[fader].as_ref().unwrap()
+        &self.scribbles[fader]
     }
 
     pub fn scribble_mut(&mut self, fader: Faders) -> &mut Scribble {
-        self.scribbles[fader].as_mut().unwrap()
+        &mut self.scribbles[fader]
     }
 
     pub fn effects(&self, effect: Preset) -> &Effects {
-        self.effects[effect].as_ref().unwrap()
+        &self.effects[effect]
     }
 
     pub fn effects_mut(&mut self, effect: Preset) -> &mut Effects {
-        self.effects[effect].as_mut().unwrap()
+        &mut self.effects[effect]
     }
 
     pub fn mute_chat_mut(&mut self) -> &mut MuteChat {
@@ -865,11 +886,11 @@ impl ProfileSettings {
     }
 
     pub fn sample_button(&self, button: SampleButtons) -> &SampleBase {
-        self.sampler_map[button].as_ref().unwrap()
+        &self.sampler_map[button]
     }
 
     pub fn sample_button_mut(&mut self, button: SampleButtons) -> &mut SampleBase {
-        self.sampler_map[button].as_mut().unwrap()
+        &mut self.sampler_map[button]
     }
 
     pub fn pitch_encoder(&self) -> &PitchEncoderBase {
@@ -905,25 +926,11 @@ impl ProfileSettings {
     }
 
     pub fn simple_element_mut(&mut self, name: SimpleElements) -> &mut SimpleElement {
-        if self.simple_elements[name].is_some() {
-            return self.simple_elements[name].as_mut().unwrap();
-        }
-
-        // If for whatever reason, this is missing, we'll use the global colour.
-        return self.simple_elements[SimpleElements::GlobalColour]
-            .as_mut()
-            .unwrap();
+        &mut self.simple_elements[name]
     }
 
     pub fn simple_element(&self, name: SimpleElements) -> &SimpleElement {
-        if self.simple_elements[name].is_some() {
-            return self.simple_elements[name].as_ref().unwrap();
-        }
-
-        // If for whatever reason, this is missing, we'll use the global colour.
-        return self.simple_elements[SimpleElements::GlobalColour]
-            .as_ref()
-            .unwrap();
+        &self.simple_elements[name]
     }
 
     pub fn context(&self) -> &Context {

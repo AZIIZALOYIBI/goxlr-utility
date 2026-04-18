@@ -4,8 +4,12 @@ use derivative::Derivative;
 use enum_map::Enum;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+
+#[cfg(feature = "serde")]
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use std::fmt::Formatter;
+
+use std::fmt::{Display, Formatter};
 use strum::{Display, EnumCount, EnumIter};
 
 #[derive(Default, Debug, Copy, Clone, Display, Enum, EnumIter, EnumCount, PartialEq, Eq)]
@@ -59,7 +63,7 @@ pub enum FaderName {
     D,
 }
 
-#[derive(Copy, Clone, Debug, Display, EnumIter, EnumCount, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Display, Enum, EnumIter, EnumCount, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(ValueEnum))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum EncoderName {
@@ -77,19 +81,121 @@ pub struct FirmwareVersions {
     pub dice: VersionNumber,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct VersionNumber(pub u32, pub u32, pub u32, pub u32);
+pub struct FirmwareDetails {
+    pub version: VersionNumber,
+    pub change_log: Option<String>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct VersionNumber(pub u32, pub u32, pub Option<u32>, pub Option<u32>);
+
+impl PartialOrd for VersionNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VersionNumber {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.0.cmp(&other.0) {
+            Ordering::Greater => return Ordering::Greater,
+            Ordering::Less => return Ordering::Less,
+            Ordering::Equal => {}
+        }
+
+        match self.1.cmp(&other.1) {
+            Ordering::Greater => return Ordering::Greater,
+            Ordering::Less => return Ordering::Less,
+            Ordering::Equal => {}
+        }
+
+        if let Some(patch) = self.2 {
+            if let Some(comparison) = other.2 {
+                match patch.cmp(&comparison) {
+                    Ordering::Greater => return Ordering::Greater,
+                    Ordering::Less => return Ordering::Less,
+                    Ordering::Equal => {}
+                }
+            } else {
+                // We have a patch number, but our comparator doesn't, assume we're greater
+                return Ordering::Greater;
+            }
+        } else if other.2.is_some() {
+            // Our comparator has a patch number, but we don't, assume we're smaller
+            return Ordering::Less;
+        }
+
+        if let Some(build) = self.3 {
+            if let Some(comparison) = other.3 {
+                match build.cmp(&comparison) {
+                    Ordering::Greater => return Ordering::Greater,
+                    Ordering::Less => return Ordering::Less,
+                    Ordering::Equal => {}
+                }
+            } else {
+                return Ordering::Greater;
+            }
+        } else if other.3.is_some() {
+            return Ordering::Less;
+        }
+        Ordering::Equal
+    }
+}
 
 impl std::fmt::Display for VersionNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}.{}", self.0, self.1, self.2, self.3)
+        if let Some(patch) = self.2 {
+            if let Some(build) = self.3 {
+                return write!(f, "{}.{}.{}.{}", self.0, self.1, patch, build);
+            }
+            return write!(f, "{}.{}.{}", self.0, self.1, patch);
+        }
+
+        write!(f, "{}.{}", self.0, self.1)
     }
 }
 
 impl std::fmt::Debug for VersionNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}.{}", self.0, self.1, self.2, self.3)
+        Display::fmt(self, f)
+    }
+}
+
+impl From<String> for VersionNumber {
+    fn from(value: String) -> Self {
+        let mut version = VersionNumber::default();
+
+        let mut parts = value.split('.');
+
+        // We can't iterate over a tuple, so we need to do this 4 times..
+        if let Some(part) = parts.next()
+            && let Ok(part) = part.parse()
+        {
+            version.0 = part;
+        }
+
+        if let Some(part) = parts.next()
+            && let Ok(part) = part.parse()
+        {
+            version.1 = part;
+        }
+
+        if let Some(part) = parts.next()
+            && let Ok(part) = part.parse()
+        {
+            version.2 = Some(part);
+        }
+
+        if let Some(part) = parts.next()
+            && let Ok(part) = part.parse()
+        {
+            version.3 = Some(part);
+        }
+
+        version
     }
 }
 
@@ -104,6 +210,7 @@ pub enum OutputDevice {
     ChatMic,
     Sampler,
     LineOut,
+    StreamMix2,
 }
 
 #[derive(Debug, Copy, Clone, Display, Enum, EnumIter, EnumCount, PartialEq, Eq, Hash)]
@@ -118,6 +225,31 @@ pub enum InputDevice {
     LineIn,
     System,
     Samples,
+}
+
+impl InputDevice {
+    pub fn can_from(channel: ChannelName) -> bool {
+        !matches!(
+            channel,
+            ChannelName::Headphones | ChannelName::MicMonitor | ChannelName::LineOut
+        )
+    }
+}
+
+impl From<ChannelName> for InputDevice {
+    fn from(value: ChannelName) -> Self {
+        match value {
+            ChannelName::Mic => InputDevice::Microphone,
+            ChannelName::LineIn => InputDevice::LineIn,
+            ChannelName::Console => InputDevice::Console,
+            ChannelName::System => InputDevice::System,
+            ChannelName::Game => InputDevice::Game,
+            ChannelName::Chat => InputDevice::Chat,
+            ChannelName::Sample => InputDevice::Samples,
+            ChannelName::Music => InputDevice::Music,
+            _ => panic!("Attempted to cast output to InputChannel!"),
+        }
+    }
 }
 
 #[derive(Debug, Eq, Copy, Clone, Display, EnumIter, EnumCount, Derivative)]
@@ -380,6 +512,8 @@ pub enum MuteFunction {
     ToVoiceChat,
     ToPhones,
     ToLineOut,
+    ToStream2,
+    ToStreams,
 }
 
 #[derive(Debug, Copy, Clone, Display, Enum, EnumIter, EnumCount, PartialEq, Eq, Hash)]
@@ -764,7 +898,16 @@ pub enum WaterfallDirection {
     Off,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Copy, Clone, EnumIter, Display, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(ValueEnum))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum VodMode {
+    #[default]
+    Routable,
+    StreamNoMusic,
+}
+
+#[derive(Default, Debug, Copy, Clone, Enum, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(ValueEnum))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum DeviceType {
@@ -772,4 +915,13 @@ pub enum DeviceType {
     Unknown,
     Full,
     Mini,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(ValueEnum))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum DriverInterface {
+    #[default]
+    TUSB,
+    LIBUSB,
 }

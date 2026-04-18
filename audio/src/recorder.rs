@@ -1,33 +1,35 @@
+use std::cmp::max;
 use std::fmt::{Debug, Formatter};
-use std::fs;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{fs, vec};
 
-use anyhow::{bail, Result};
-use bounded_vec_deque::BoundedVecDeque;
+use anyhow::{Result, bail};
 use ebur128::{EbuR128, Mode};
 use fancy_regex::Regex;
 use hound::WavWriter;
-use log::{debug, error, info, warn};
-use rb::{Producer, RbConsumer, RbProducer, SpscRb, RB};
+use log::{debug, error, info, trace, warn};
+use rb::{Producer, RB, RbConsumer, RbError, RbProducer, SpscRb};
 use symphonia::core::audio::{Layout, SignalSpec};
 
-use crate::audio::{get_input, AudioInput, AudioSpecification};
-use crate::get_audio_inputs;
+use crate::audio::{AudioInput, AudioSpecification, get_input};
+use crate::ringbuffer::RingBuffer;
+use crate::{AtomicF64, get_audio_inputs};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 static READ_TIMEOUT: Duration = Duration::from_millis(100);
+static CHECK_PERIOD: Duration = Duration::from_secs(60 * 15);
 
 pub struct BufferedRecorder {
     devices: Vec<Regex>,
     producers: Mutex<Vec<RingProducer>>,
     buffer_size: usize,
-    buffer: Mutex<BoundedVecDeque<f32>>,
+    buffer: RingBuffer<f32>,
     stop: Arc<AtomicBool>,
     is_ready: Arc<AtomicBool>,
 }
@@ -40,6 +42,7 @@ pub struct RingProducer {
 #[derive(Debug, Clone)]
 pub struct RecorderState {
     pub stop: Arc<AtomicBool>,
+    pub gain: Arc<AtomicF64>,
 }
 
 impl Debug for BufferedRecorder {
@@ -53,8 +56,28 @@ impl Debug for BufferedRecorder {
 
 impl BufferedRecorder {
     pub fn new(devices: Vec<String>, buffer_millis: usize) -> Result<Self> {
-        // Buffer size is simple, 48 samples a milli for 2 channels..
-        let buffer_size = (48 * 2) * buffer_millis;
+        // We need to attempt to accommodate for the time it takes between a user hitting a button
+        // on the GoXLR, and us being signalled for record.
+        //
+        // From my testing, the time from 'Button Notification' to 'Ready for Samples' takes about
+        // 4ms.
+        //
+        // On Linux, the polling time for 'Notifications' is 20ms, so we can safely assume that
+        // 25ms is the absolute max amount of time between someone pressing a button, and the
+        // audio handler being ready.
+        //
+        // On Windows, we receive 'Notification' messages via USB URB INTERRUPTS, which are far
+        // more responsive, allowing us to get the Notification in under 5ms from when the button
+        // is pressed, so a 15ms buffer should be sufficient.
+        //
+        // So we'll make this buffer OS relevant.
+        let forced_buffer = if cfg!(target_os = "windows") {
+            (48 * 2) * 15
+        } else {
+            (48 * 2) * 30
+        };
+        let user_buffer = (48 * 2) * buffer_millis;
+        let buffer_size = max(forced_buffer, user_buffer);
 
         // Convert the list of Strings into a Regexp vec..
         let regex = devices
@@ -70,7 +93,8 @@ impl BufferedRecorder {
             producers: Mutex::new(vec![]),
 
             buffer_size,
-            buffer: Mutex::new(BoundedVecDeque::new(buffer_size)),
+            //buffer: Mutex::new(BoundedVecDeque::new(buffer_size)),
+            buffer: RingBuffer::new(buffer_size),
 
             stop: Arc::new(AtomicBool::new(false)),
             is_ready: Arc::new(AtomicBool::new(false)),
@@ -82,6 +106,8 @@ impl BufferedRecorder {
 
         // We need to find a matching input..
         let mut input: Option<Box<dyn AudioInput>> = None;
+
+        let mut now = Instant::now();
 
         while !self.stop.load(Ordering::Relaxed) {
             if input.is_none() {
@@ -106,19 +132,26 @@ impl BufferedRecorder {
                 sleep(Duration::from_millis(500));
                 continue;
             } else {
-                // Read the latest samples from the input..
+                // Read the latest samples from the input...
                 match input.as_mut().unwrap().read() {
                     Ok(samples) => {
-                        if self.buffer_size > 0 {
-                            let mut buffer = self.buffer.lock().unwrap();
-                            for sample in &samples {
-                                buffer.push_back(*sample);
-                            }
+                        if self.buffer_size > 0
+                            && let Err(e) = self.buffer.write_into(&samples)
+                        {
+                            warn!("Error writing samples to buffer: {}", e);
                         }
                         for producer in self.producers.lock().unwrap().iter() {
                             let result = producer.producer.write(&samples);
-                            if result.is_err() {
-                                debug!("Error writing to producer: {:?}", result.err());
+                            if let Err(e) = result {
+                                match e {
+                                    RbError::Full => {
+                                        // This can happen when buffers are full prior to general
+                                        // setup being complete, so we'll just ignore it for now.
+                                    }
+                                    e => {
+                                        warn!("Error writing to producer: {:?}", e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -129,9 +162,47 @@ impl BufferedRecorder {
                         debug!("Shutting down input, and clearing buffer.");
                         input = None;
                         self.is_ready.store(false, Ordering::Relaxed);
-                        self.buffer.lock().unwrap().clear();
+
+                        // Clear the Buffer
+                        self.buffer.clear();
                     }
                 }
+            }
+
+            // Has a minute passed?
+            if now.elapsed() > CHECK_PERIOD {
+                // Update the timer for next poll regardless..
+                now = Instant::now();
+
+                if !self.producers.lock().unwrap().is_empty() {
+                    // Something is actively recording, don't break the loop..
+                    continue;
+                }
+
+                // If the EBU failed to initialise, we're SOL really..
+                if let Ok(ebu) = &mut EbuR128::new(2, 48000, Mode::SAMPLE_PEAK) {
+                    // Grab the samples from the buffer..
+                    let samples = self.get_samples_from_buffer();
+
+                    // Check if any of them would constitute 'recordable' audio..
+                    let mut received_audio = false;
+                    if let Ok(has_audio) = self.is_audio(ebu, samples.as_slice()) {
+                        received_audio = has_audio;
+                    }
+
+                    // Push out and let it continue..
+                    if received_audio {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                // If we get here, nothing has stopped us, tear down the audio handler, and sleep..
+                input.unwrap().flush();
+                input = None;
+                self.is_ready.store(false, Ordering::Relaxed);
+                self.buffer.clear();
             }
         }
 
@@ -168,9 +239,9 @@ impl BufferedRecorder {
         // So this will likely be spawned in a different thread, to actually handle the record
         // process.. with path being the file path to handle!
 
-        // We create a second long buffer for audio input as we need to continue receiving
+        // We create a 4-second buffer for audio input as we need to continue receiving
         // audio while we're creating files, setting up the encoder, and handling the initial buffer.
-        let ring_buf = SpscRb::<f32>::new(48000 * 2);
+        let ring_buf = SpscRb::<f32>::new(48000 * 4);
         let (ring_buf_producer, ring_buf_consumer) = (ring_buf.producer(), ring_buf.consumer());
 
         let producer_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -182,17 +253,7 @@ impl BufferedRecorder {
         });
 
         // Grab the contents of the buffer, and push it into a simple vec
-        let mut pre_samples = vec![];
-        if self.buffer_size > 0 {
-            let buffer = self.buffer.lock().unwrap();
-            let (front, back) = buffer.as_slices();
-            for sample in front {
-                pre_samples.push(*sample);
-            }
-            for sample in back {
-                pre_samples.push(*sample);
-            }
-        }
+        let pre_samples = self.get_samples_from_buffer();
 
         // Get the read buffer to pull a quarter of a second at a time..
         let mut read_buffer: [f32; 24000] = [0.0; 24000];
@@ -206,13 +267,26 @@ impl BufferedRecorder {
         };
         let mut writer = hound::WavWriter::create(path, spec)?;
 
-        // Set up the Audio Checker for volume..
-        let mut ebu_r128 = EbuR128::new(2, 48000, Mode::I)?;
+        // EBU Prep is here to make sure that recent samples have hit a threshold to start recording.
+        let mut ebu_prep_r128 = EbuR128::new(2, 48000, Mode::SAMPLE_PEAK)?;
+
+        // EBU Rec is here to perform the needed gain calculations on what has already been recorded
+        let mut ebu_rec_r128 = EbuR128::new(2, 48000, Mode::I)?;
+
+        // Whether we're writing to a file.
         let mut writing = false;
+
+        state.gain.store(2., Ordering::Relaxed);
 
         // We are all setup, now write the contents of the buffer into the file..
         if self.buffer_size > 0 {
-            match self.handle_samples(pre_samples, &mut ebu_r128, writing, &mut writer) {
+            match self.handle_samples(
+                pre_samples,
+                &mut ebu_prep_r128,
+                &mut ebu_rec_r128,
+                writing,
+                &mut writer,
+            ) {
                 Ok(result) => writing = result,
                 Err(error) => {
                     error!("Error Writing Samples {}", error);
@@ -221,14 +295,22 @@ impl BufferedRecorder {
             };
         }
 
-        // Now jump into the current 'live' audio.
-        while !state.stop.load(Ordering::Relaxed) {
+        // Now jump into the current 'live' audio. This is essentially a do-while loop, just to
+        // make sure we don't lose the last 'chunk' of audio which may have been partially recorded
+        // when the button was released.
+        loop {
             if let Ok(Some(samples)) =
                 ring_buf_consumer.read_blocking_timeout(&mut read_buffer, READ_TIMEOUT)
             {
                 // Read these out into a vec..
                 let samples: Vec<f32> = Vec::from(&read_buffer[0..samples]);
-                match self.handle_samples(samples, &mut ebu_r128, writing, &mut writer) {
+                match self.handle_samples(
+                    samples,
+                    &mut ebu_prep_r128,
+                    &mut ebu_rec_r128,
+                    writing,
+                    &mut writer,
+                ) {
                     Ok(result) => writing = result,
                     Err(error) => {
                         // Something's gone wrong, we need to fail safe..
@@ -237,6 +319,9 @@ impl BufferedRecorder {
                         state.stop.store(true, Ordering::Relaxed);
                     }
                 }
+            }
+            if state.stop.load(Ordering::Relaxed) {
+                break;
             }
         }
 
@@ -249,16 +334,52 @@ impl BufferedRecorder {
             // No noise received..
             info!("No Noise Received, or error in recording, Cancelling.");
             fs::remove_file(path)?;
+        } else {
+            // We have noise recorded, try to normalise it..
+            let mut loudness = ebu_rec_r128.loudness_global()?;
+            if loudness == f64::NEG_INFINITY {
+                debug!("Unable to Obtain loudness in Mode I, trying M..");
+                loudness = ebu_rec_r128.loudness_momentary()?;
+            }
+
+            if loudness == f64::NEG_INFINITY {
+                debug!("Unable to Obtain loudness in Mode M, Setting Default..");
+                state.gain.store(1.0, Ordering::Relaxed);
+            } else {
+                let target = -23.0;
+                let gain_db = target - loudness;
+                let value = f64::powf(10., gain_db / 20.);
+
+                // If we need to multiply the input by over 200, we're pulling in something
+                // *FAR* to quiet to handle properly, so we'll reject it.
+                if value > 200. {
+                    debug!("Received Noise too quiet, cannot handle sanely, Cancelling.");
+                    fs::remove_file(path)?;
+                } else {
+                    state.gain.store(value, Ordering::Relaxed);
+                }
+            }
         }
 
         self.del_producer(producer_id);
         Ok(())
     }
 
+    fn get_samples_from_buffer(&self) -> Vec<f32> {
+        if self.buffer_size > 0 {
+            return self.buffer.read_buffer().unwrap_or_else(|e| {
+                warn!("Error Reading Samples from Buffer: {}", e);
+                vec![]
+            });
+        }
+        vec![]
+    }
+
     fn handle_samples(
         &self,
         samples: Vec<f32>,
-        ebu_r128: &mut EbuR128,
+        ebu_prep_r128: &mut EbuR128,
+        ebu_rec_r128: &mut EbuR128,
         writing: bool,
         writer: &mut WavWriter<BufWriter<File>>,
     ) -> Result<bool> {
@@ -267,26 +388,41 @@ impl BufferedRecorder {
         // Split into 50ms chunks
         for slice in samples.chunks(4800) {
             if !recording_started {
-                recording_started = self.is_audio(ebu_r128, slice)?;
+                recording_started = self.is_audio(ebu_prep_r128, slice)?;
             }
 
             if recording_started {
+                // We are recording, add the samples to the recorded gain calc
+                let _ = ebu_rec_r128.add_frames_f32(slice);
+
                 for sample in slice {
                     // Multiply the sample by 2^23, to convert to a pseudo I24
                     writer.write_sample((*sample * 8388608.0) as i32)?;
                 }
             }
         }
+
         Ok(recording_started)
     }
 
     fn is_audio(&self, ebu_r128: &mut EbuR128, samples: &[f32]) -> Result<bool> {
-        // The GoXLR seems to have a noise floor of roughly -100dB, so we're going
-        // to listen for anything louder than -80dB and consider that 'useful' audio.
-        ebu_r128.add_frames_f32(samples)?;
-        if let Ok(loudness) = ebu_r128.loudness_momentary() {
-            if loudness > -45. {
-                return Ok(true);
+        // We're going to check this on a 8 frame basis..
+        for samples in samples.chunks(16) {
+            ebu_r128.add_frames_f32(samples)?;
+
+            // We're now going to take a look at the 'Loudness' of these 8 frames..
+            if let Ok(loudness) = ebu_r128.loudness_window((samples.len() / 2) as u32) {
+                // We have a target of -23dB, work out the distance from there..
+                let target = -23.0;
+                let gain_db = target - loudness;
+                let value = f64::powf(10., gain_db / 20.);
+
+                // So when we get here, loudness * value = -23dB, this gives 'value' a linear
+                // distance from the target, so if we're having to multiply the samples over 200
+                // times to get there, the source audio is likely too quiet to use.
+                if value < 200. {
+                    return Ok(true);
+                }
             }
         }
 
@@ -309,7 +445,7 @@ impl BufferedRecorder {
             .cloned();
 
         if let Some(device) = &device {
-            debug!("Found Device: {}", device);
+            trace!("Found Device: {}", device);
             return Some(device.clone());
         }
         None
@@ -318,6 +454,8 @@ impl BufferedRecorder {
 
 impl Drop for BufferedRecorder {
     fn drop(&mut self) {
+        debug!("Recorder Dropped, stopping thread..");
+
         // We probably don't need to do this, as drop will only be called after the main
         // thread has terminated, but safety first :)
         self.stop.store(true, Ordering::Relaxed);

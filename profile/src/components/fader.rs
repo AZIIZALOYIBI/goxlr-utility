@@ -4,10 +4,11 @@ use std::io::Write;
 use strum::{EnumProperty, IntoEnumIterator};
 
 use anyhow::Result;
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesStart, Event};
 
-use crate::components::colours::ColourMap;
+use crate::Faders;
+use crate::components::colours::{Colour, ColourDisplay, ColourMap, ColourOffStyle};
 use crate::components::mixer::FullChannelList;
 use crate::profile::Attribute;
 
@@ -34,11 +35,28 @@ pub struct Fader {
 }
 
 impl Fader {
-    pub fn new(id: u8) -> Self {
-        let colour_map = format!("FaderMeter{id}");
+    pub fn new(fader: Faders) -> Self {
+        let context = fader.get_str("faderContext").unwrap();
+
+        // Build a Default ColourMap..
+        let mut colour_map = ColourMap::new(context.to_string());
+        colour_map.set_fader_display(ColourDisplay::TwoColour);
+        colour_map.set_off_style(ColourOffStyle::Dimmed);
+        colour_map.set_colour(0, Colour::fromrgb("000000").unwrap());
+        colour_map.set_colour(1, Colour::fromrgb("00FFFF").unwrap());
+        colour_map.set_colour_group("faderGroup".to_string());
+
+        // Get a Default Channel..
+        let channel = match fader {
+            Faders::A => FullChannelList::Mic,
+            Faders::B => FullChannelList::Music,
+            Faders::C => FullChannelList::Chat,
+            Faders::D => FullChannelList::System,
+        };
+
         Self {
-            colour_map: ColourMap::new(colour_map),
-            channel: FullChannelList::Mic,
+            colour_map,
+            channel,
         }
     }
 
@@ -71,12 +89,9 @@ impl Fader {
         Ok(())
     }
 
-    pub fn write_fader<W: Write>(
-        &self,
-        element_name: String,
-        writer: &mut Writer<W>,
-    ) -> Result<()> {
-        let mut elem = BytesStart::new(element_name.as_str());
+    pub fn write_fader<W: Write>(&self, writer: &mut Writer<W>, fader: Faders) -> Result<()> {
+        let element_name = fader.get_str("faderContext").unwrap();
+        let mut elem = BytesStart::new(element_name);
 
         let mut attributes: HashMap<String, String> = HashMap::default();
         attributes.insert(
@@ -85,7 +100,7 @@ impl Fader {
         );
 
         self.colour_map
-            .write_colours_with_prefix(element_name.clone(), &mut attributes);
+            .write_colours_with_prefix(element_name.into(), &mut attributes);
 
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));

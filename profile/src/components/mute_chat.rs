@@ -4,9 +4,9 @@ use std::io::Write;
 use enum_map::Enum;
 use strum::EnumProperty;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-use crate::components::colours::{ColourMap, ColourState};
+use crate::components::colours::{Colour, ColourMap, ColourOffStyle, ColourState};
 use crate::components::mute::MuteFunction;
 use crate::components::mute_chat::CoughToggle::Hold;
 
@@ -26,8 +26,8 @@ pub enum ParseError {
     InvalidColours(#[from] crate::components::colours::ParseError),
 }
 use crate::profile::Attribute;
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesStart, Event};
 use std::str::FromStr;
 
 /**
@@ -50,10 +50,17 @@ pub struct MuteChat {
 
 impl MuteChat {
     pub fn new(element_name: String) -> Self {
-        let colour_map = element_name.clone();
+        let mut colour_map = ColourMap::new(element_name.clone());
+        colour_map.set_off_style(ColourOffStyle::Dimmed);
+        colour_map.set_blink_on(false);
+        colour_map.set_state_on(false);
+        colour_map.set_colour(0, Colour::fromrgb("00FFFF").unwrap());
+        colour_map.set_colour(1, Colour::fromrgb("000000").unwrap());
+        colour_map.set_velocity(127);
+
         Self {
             element_name,
-            colour_map: ColourMap::new(colour_map),
+            colour_map,
             mic_fader_id: 4,
             blink: ColourState::Off,
             cough_behaviour: Hold,

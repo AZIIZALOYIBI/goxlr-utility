@@ -1,31 +1,48 @@
-use std::mem;
-use std::ptr::null_mut;
+use std::ffi::c_void;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::thread::sleep;
 use std::time::Duration;
+use std::{mem, ptr};
 
-use anyhow::{bail, Result};
-use goxlr_ipc::PathTypes;
-use log::{debug, warn};
+use anyhow::{Result, bail};
+use lazy_static::lazy_static;
+use log::{debug, error, warn};
 use tokio::sync::mpsc::Sender;
-use win_win::{WindowBuilder, WindowClass, WindowProc};
-use winapi::shared::guiddef::GUID;
-use winapi::shared::minwindef::{DWORD, FALSE, HINSTANCE, LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, POINT};
-use winapi::um::shellapi::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW};
-use winapi::um::winuser::{
-    AppendMenuW, CreateIcon, DestroyWindow, DispatchMessageW, GetMessageW, SetTimer,
-    ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy, TranslateMessage, MENUINFO, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, WM_USER,
+use tokio::sync::oneshot;
+use windows::Win32::Foundation::{
+    FALSE, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use winapi::um::{shellapi, winuser};
+use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{
+    NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
+};
+use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFY_ICON_DATA_FLAGS,
+    NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW, Shell_NotifyIconW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
+    GetWindowLongPtrW, HICON, HMENU, MENUINFO, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, RegisterClassW, RegisterWindowMessageW,
+    SetMenuInfo, SetTimer, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CREATE, WM_NCDESTROY, WM_USER, WNDCLASSW,
+};
+use windows::core::w;
+
+use goxlr_ipc::PathTypes;
 
 use crate::events::EventTriggers::Open;
 use crate::events::{DaemonState, EventTriggers};
-use crate::platform::to_wide;
-use crate::tray::get_icon_from_global;
 
 const EVENT_MESSAGE: u32 = WM_USER + 1;
+
+lazy_static! {
+    static ref RESPAWN: u32 = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+}
 
 pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> Result<()> {
     debug!("Spawning Windows Tray..");
@@ -37,58 +54,37 @@ pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> Result<()> 
 }
 fn create_window(state: DaemonState, tx: Sender<EventTriggers>) -> Result<()> {
     // To save some headaches, this is *ALL* unsafe!
+    debug!("Creating Window for Tray");
     unsafe {
-        // Load up the icon..
-        let icon = load_icon()?;
-
-        // Use win_win to setup our Window..
-        let win_class = WindowClass::builder("goxlr-utility").build().unwrap();
-
-        let sub = winuser::CreatePopupMenu();
-        AppendMenuW(sub, MF_STRING, 10, to_wide("Profiles").as_ptr());
-        AppendMenuW(sub, MF_STRING, 11, to_wide("Mic Profiles").as_ptr());
-        AppendMenuW(sub, MF_SEPARATOR, 12, null_mut());
-        AppendMenuW(sub, MF_STRING, 13, to_wide("Presets").as_ptr());
-        AppendMenuW(sub, MF_STRING, 14, to_wide("Samples").as_ptr());
-        AppendMenuW(sub, MF_STRING, 15, to_wide("Icons").as_ptr());
-        AppendMenuW(sub, MF_SEPARATOR, 16, null_mut());
-        AppendMenuW(sub, MF_STRING, 17, to_wide("Logs").as_ptr());
+        debug!("Creating SubMenu");
+        let sub = CreatePopupMenu()?;
+        AppendMenuW(sub, MF_STRING, 10, w!("Profiles"))?;
+        AppendMenuW(sub, MF_STRING, 11, w!("Mic Profiles"))?;
+        AppendMenuW(sub, MF_SEPARATOR, 12, None)?;
+        AppendMenuW(sub, MF_STRING, 13, w!("Presets"))?;
+        AppendMenuW(sub, MF_STRING, 14, w!("Samples"))?;
+        AppendMenuW(sub, MF_STRING, 15, w!("Icons"))?;
+        AppendMenuW(sub, MF_SEPARATOR, 16, None)?;
+        AppendMenuW(sub, MF_STRING, 17, w!("Logs"))?;
 
         // Create the Main Menu..
-        let hmenu = winuser::CreatePopupMenu();
-        AppendMenuW(hmenu, MF_STRING, 0, to_wide("Configure GoXLR").as_ptr());
-        AppendMenuW(hmenu, MF_SEPARATOR, 1, null_mut());
-        AppendMenuW(hmenu, MF_POPUP, sub as usize, to_wide("Open Path").as_ptr());
-        AppendMenuW(hmenu, MF_SEPARATOR, 3, null_mut());
-        AppendMenuW(hmenu, MF_STRING, 4, to_wide("Quit").as_ptr());
+        debug!("Creating Main Menu..");
+        let hmenu = CreatePopupMenu()?;
+        AppendMenuW(hmenu, MF_STRING, 0, w!("Configure GoXLR"))?;
+        AppendMenuW(hmenu, MF_SEPARATOR, 1, None)?;
+        AppendMenuW(hmenu, MF_POPUP, sub.0 as usize, w!("Open Path"))?;
+        AppendMenuW(hmenu, MF_SEPARATOR, 3, None)?;
+        AppendMenuW(hmenu, MF_STRING, 4, w!("Quit"))?;
 
+        debug!("Generating Window Proc");
         let window_proc = GoXLRWindowProc::new(state.clone(), tx, hmenu);
-        let hwnd = WindowBuilder::new(window_proc, &win_class)
-            .name("GoXLR Utility")
-            .size(20, 20)
-            .build();
+        let wrapped_proc: Rc<Box<dyn WindowProc>> = Rc::new(Box::new(window_proc));
 
-        // Create the notification tray item..
-        let mut tray_item = get_notification_struct(&hwnd);
-        tray_item.szTip = tooltip("GoXLR Utility");
-        tray_item.hIcon = icon;
-        tray_item.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON;
-        tray_item.uCallbackMessage = EVENT_MESSAGE;
+        debug!("Getting HWND");
+        let hwnd = create_hwnd(wrapped_proc)?;
 
-        if state.show_tray.load(Ordering::Relaxed)
-            && shellapi::Shell_NotifyIconW(NIM_ADD, &mut tray_item as *mut NOTIFYICONDATAW) == 0
-        {
-            bail!("Unable to Create Tray Icon");
-        }
-        // Make sure the window is spawned hidden, begin our main loop.
+        debug!("Beginning Tray Runtime Loop");
         run_loop(hwnd, state.clone());
-
-        // If we get here, the loop is done, remove our tray icon.
-        if state.show_tray.load(Ordering::Relaxed)
-            && shellapi::Shell_NotifyIconW(NIM_DELETE, &mut tray_item as *mut NOTIFYICONDATAW) == 0
-        {
-            bail!("Unable to remove Tray Icon!");
-        }
     }
 
     Ok(())
@@ -98,34 +94,90 @@ fn run_loop(msg_window: HWND, state: DaemonState) {
     // Because we need to keep track of other things here, we're going to use PeekMessageW rather
     // than GetMessageW, then use WaitForSingleObject with a timeout to keep the loop looping.
 
+    debug!("Running Main Window Loop");
     // Turns out, WaitForSingleObject doesn't work for window HWNDs..
     unsafe {
         // Send a message to the window to be be processed 20ms after we hit here..
-        SetTimer(msg_window, 120, 20, None);
+        SetTimer(Some(msg_window), 120, 20, None);
         loop {
             let mut msg = mem::MaybeUninit::uninit();
-            if GetMessageW(msg.as_mut_ptr(), msg_window, 0, 0) != FALSE {
+            if GetMessageW(msg.as_mut_ptr(), Some(msg_window), 0, 0) != FALSE {
                 let msg = msg.assume_init();
 
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
             // Check to see if we've reached Shutdown Stage 2..
             if state.shutdown_blocking.load(Ordering::Relaxed) {
                 debug!("Shutdown Phase 2 active, destroy the window.");
-                DestroyWindow(msg_window);
+                let _ = DestroyWindow(msg_window);
                 break;
             }
 
             // This will trigger a return of GetMessageW in theory..
-            SetTimer(msg_window, 120, 20, None);
+            SetTimer(Some(msg_window), 120, 20, None);
         }
     }
     debug!("Primary Loop Ended");
 }
 
+fn create_hwnd(proc: Rc<Box<dyn WindowProc>>) -> Result<HWND> {
+    let h_instance: HINSTANCE = unsafe { GetModuleHandleW(None) }?.into();
+    let lp_sz_class_name = w!("GoXLR Utility");
+    let lp_sz_window_name = w!("GoXLR Utility");
+
+    // Create our Window Class..
+    let window_class = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(raw_window_proc),
+        hInstance: h_instance,
+        lpszClassName: lp_sz_class_name,
+        ..Default::default()
+    };
+
+    // Register it..
+    if unsafe { RegisterClassW(&window_class) } == 0 {
+        bail!("Unable to Register Window Class: {:?}", unsafe {
+            GetLastError()
+        });
+    }
+
+    // Now attempt to create our HWND...
+    let window_pointer = Rc::into_raw(proc) as *const c_void;
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            window_class.lpszClassName,
+            lp_sz_window_name,
+            WINDOW_STYLE(0),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            None,
+            None,
+            Some(window_class.hInstance),
+            Some(window_pointer),
+        )
+    }?;
+
+    // Attempt to Create the Tray Icon..
+    if hwnd == HWND(ptr::null_mut()) {
+        bail!("Unable to create the HWND: {:?}", unsafe { GetLastError() });
+    }
+
+    unsafe {
+        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_err() {
+            warn!("Unable to Register Current Session Notifications");
+        }
+    }
+
+    Ok(hwnd)
+}
+
 fn load_icon() -> Result<HICON> {
+    debug!("Loading Tray Icon");
     let (rgba, width, height) = get_icon_from_global();
 
     let count = rgba.len() / 4;
@@ -136,7 +188,7 @@ fn load_icon() -> Result<HICON> {
 
     let icon = unsafe {
         CreateIcon(
-            0 as HINSTANCE,
+            None,
             width as i32,
             height as i32,
             1,
@@ -144,10 +196,7 @@ fn load_icon() -> Result<HICON> {
             alpha_mask.as_ptr(),
             rgba.as_ptr(),
         )
-    };
-    if icon == null_mut() as HICON {
-        bail!("Unable to Load Icon");
-    }
+    }?;
     Ok(icon)
 }
 
@@ -156,6 +205,8 @@ struct GoXLRWindowProc {
     state: DaemonState,
     global_tx: Sender<EventTriggers>,
     menu: HMENU,
+
+    shutdown_triggered: bool,
 }
 
 impl GoXLRWindowProc {
@@ -164,51 +215,107 @@ impl GoXLRWindowProc {
             state,
             global_tx: tx,
             menu,
+            shutdown_triggered: false,
+        }
+    }
+
+    fn create_tray(&self, hwnd: HWND) -> Option<NOTIFYICONDATAW> {
+        if let Ok(icon) = load_icon() {
+            debug!("Generating Tray Item");
+
+            let mut tray_item = get_notification_struct(hwnd);
+            tray_item.szTip = tooltip("GoXLR Utility");
+            tray_item.hIcon = icon;
+            tray_item.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON;
+            tray_item.uCallbackMessage = EVENT_MESSAGE;
+
+            return Some(tray_item);
+        }
+        None
+    }
+
+    fn create_icon(&self, hwnd: HWND) {
+        if !self.state.show_tray.load(Ordering::Relaxed) {
+            debug!("Tray Disabled, doing nothing.");
+            return;
+        }
+
+        debug!("Calling Tray Spawner");
+        self.spawn_tray(hwnd, NIM_ADD);
+    }
+
+    fn destroy_icon(&self, hwnd: HWND) {
+        if !self.state.show_tray.load(Ordering::Relaxed) {
+            return;
+        }
+        debug!("Destroying Tray Icon");
+        self.spawn_tray(hwnd, NIM_DELETE);
+    }
+
+    fn spawn_tray(&self, hwnd: HWND, action: NOTIFY_ICON_MESSAGE) {
+        debug!("Creating Tray Handler");
+        if let Some(mut tray) = self.create_tray(hwnd) {
+            let tray = &mut tray as *mut NOTIFYICONDATAW;
+
+            unsafe {
+                debug!("Performing Tray Action");
+                if Shell_NotifyIconW(action, tray) == FALSE {
+                    error!("Unable to Load Tray Icon");
+                }
+            }
         }
     }
 
     fn create_menu(&self) {
+        debug!("Creating Menu");
         let m = MENUINFO {
-            cbSize: mem::size_of::<MENUINFO>() as DWORD,
+            cbSize: mem::size_of::<MENUINFO>() as u32,
             fMask: MIM_APPLYTOSUBMENUS | MIM_STYLE,
             dwStyle: MNS_NOTIFYBYPOS,
             cyMax: 0,
-            hbrBack: 0 as HBRUSH,
+            hbrBack: HBRUSH::default(),
             dwContextHelpID: 0,
             dwMenuData: 0,
         };
         unsafe {
-            if winuser::SetMenuInfo(self.menu, &m as *const MENUINFO) == 0 {
+            debug!("Setting Menu Info");
+            if SetMenuInfo(self.menu, &m as *const MENUINFO).is_err() {
                 warn!("Error Setting Up Menu.");
-            }
+            };
         }
     }
 }
 
 impl WindowProc for GoXLRWindowProc {
     fn window_proc(
-        &self,
+        &mut self,
         hwnd: HWND,
-        msg: UINT,
+        msg: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<LRESULT> {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        //debug!("{:?} - {:?} - {:?} - {:?}", hwnd, msg, wparam, lparam);
+
         match msg {
-            winuser::WM_CREATE => {
+            WM_CREATE => {
+                debug!("Window Created, Spawn icon and Menu");
+
                 // Window has spawned, Create our Menu :)
-                debug!("Window Spawned, creating menu..");
+                self.create_icon(hwnd);
                 self.create_menu();
             }
             // Menu Related Commands..
-            winuser::WM_MENUCOMMAND => unsafe {
-                if lparam as HMENU == self.menu {
-                    debug!("Top Menu?");
-                }
-                let menu_id = winuser::GetMenuItemID(lparam as HMENU, wparam as i32) as i32;
+            WM_MENUCOMMAND => unsafe {
+                // We're going to grab the isize pointer to the menu, then pass that in.
+                //let hmenu = lparam.0 as *const isize as isize;
+                let npos = wparam.0 as *const i32 as i32;
+
+                let menu_id = GetMenuItemID(HMENU(lparam.0 as *mut c_void), npos);
                 let _ = match menu_id {
                     // Main Menu
                     0 => self.global_tx.try_send(EventTriggers::Activate),
-                    4 => self.global_tx.try_send(EventTriggers::Stop),
+                    4 => self.global_tx.try_send(EventTriggers::Stop(false)),
 
                     // Open Paths Menu
                     10 => self.global_tx.try_send(Open(PathTypes::Profiles)),
@@ -227,49 +334,75 @@ impl WindowProc for GoXLRWindowProc {
             },
 
             EVENT_MESSAGE => {
-                if lparam as UINT == winuser::WM_LBUTTONUP
-                    || lparam as UINT == winuser::WM_RBUTTONUP
-                {
+                let button = lparam.0 as *const u32 as u32;
+                if button == WM_LBUTTONUP || button == WM_RBUTTONUP {
                     let mut point = POINT { x: 0, y: 0 };
                     unsafe {
-                        if winuser::GetCursorPos(&mut point as *mut POINT) == 0 {
-                            return Some(1);
+                        if GetCursorPos(&mut point as *mut POINT).is_err() {
+                            return Some(LRESULT(1));
                         }
-                        if lparam as UINT == winuser::WM_LBUTTONUP {
+                        if button == WM_LBUTTONUP {
                             let _ = self.global_tx.try_send(EventTriggers::Activate);
                             return None;
                         }
-                        if lparam as UINT == winuser::WM_RBUTTONUP {
+                        if button == WM_RBUTTONUP {
                             // The docs say if the window isn't foreground, the menu wont close!
-                            winuser::SetForegroundWindow(hwnd);
+                            if SetForegroundWindow(hwnd) == FALSE {
+                                warn!("Unable to Set window to Foreground");
+                            }
 
                             // Create the menu at the coordinates of the mouse.
-                            winuser::TrackPopupMenu(
+                            if TrackPopupMenu(
                                 self.menu,
-                                0,
+                                TPM_BOTTOMALIGN | TPM_LEFTALIGN,
                                 point.x,
                                 point.y,
-                                (winuser::TPM_BOTTOMALIGN | winuser::TPM_LEFTALIGN) as i32,
+                                None,
                                 hwnd,
-                                null_mut(),
-                            );
+                                None,
+                            ) == FALSE
+                            {
+                                warn!("Unable to Set Menu Coordinates!");
+                            }
                         }
                     }
                 }
             }
 
+            WM_DESTROY => {
+                debug!("Windows Destroyed, killing Tray Icon");
+                self.destroy_icon(hwnd);
+            }
+
             // Window Handler
-            winuser::WM_CLOSE => {
+            WM_CLOSE => {
                 // If something tries to close this hidden window, it's a good bet that it wants
                 // us to shutdown, start the shutdown, but don't close the Window.
-                let _ = self.global_tx.try_send(EventTriggers::Stop);
-                return Some(1);
+                let _ = self.global_tx.try_send(EventTriggers::Stop(false));
+                return Some(LRESULT(1));
             }
 
             // // Shutdown Handlers..
-            winuser::WM_QUERYENDSESSION => {
-                debug!("Received WM_QUERYENDSESSION from Windows");
+            WM_QUERYENDSESSION => {
+                let end_session = lparam.0 as *const u32 as u32;
+                debug!("EndSession: {}", end_session);
+                let close_app = end_session & ENDSESSION_CLOSEAPP == ENDSESSION_CLOSEAPP;
+                let critical = end_session & ENDSESSION_CRITICAL == ENDSESSION_CRITICAL;
+                let logoff = end_session & ENDSESSION_LOGOFF == ENDSESSION_LOGOFF;
 
+                let mut method = String::from("WM_QUERYENDSESSION");
+                if close_app {
+                    method.push_str(" - ENDSESSION_CLOSEAPP");
+                }
+                if critical {
+                    method.push_str(" - ENDSESSION_CRITICAL");
+                }
+                if logoff {
+                    method.push_str("- ENDSESSION_LOGOFF");
+                }
+                method.push(')');
+
+                debug!("Received {} from Windows, Shutting Down..", method);
                 /*
                  Ref: https://learn.microsoft.com/en-us/windows/win32/shutdown/wm-queryendsession
 
@@ -278,33 +411,40 @@ impl WindowProc for GoXLRWindowProc {
                   message, regardless of how the other applications respond to the
                   WM_QUERYENDSESSION message."
 
-                  This is not necessarily true, the problem is that if a Window on the application
-                  gets destroyed (via DestroyWindow()) Windows will immediately kill the app,
-                  regardless of how many other windows exist.
+                  The problem we run into, is that the TTS service spawns an invisible window to
+                  handle media playback, and if it receives the WM_ENDSESSION message and calls
+                  DestroyWindow, Windows will assume the entire Utility is done and kill the
+                  process. This prevents the WM_ENDSESSION message from reaching us here preventing
+                  us from correctly handling the shutdown.
 
-                  This code was moved to here simply because a library needed to communicate with
-                  the GoXLR was spawning a hidden window to handle PnP events with and it's own
-                  mainloop. This window was killing the util before the shutdown was able to
-                  process.
-
-                  The code was moved here because we could generally catch it 80% of the time, but
-                  now the hidden PnP window has now been dealt we could *PROBABLY* move this back
-                  into ENDSESSION, but seeing as it'll work just as fine here, I'm not gonna move it
-                  lest getting dragged back into the debugging :p
+                  Consequently, we're forced to try and get ahead of it and handle our shutdown
+                  behaviours in the 'wrong' place, but we're at least guaranteed to be handled.
                 */
 
                 unsafe {
-                    ShutdownBlockReasonCreate(hwnd, to_wide("Running Shutdown").as_ptr());
+                    let _ = ShutdownBlockReasonCreate(hwnd, w!("Running Shutdown.."));
                 }
 
-                debug!("Attempting Shutdown..");
-                let _ = self.global_tx.try_send(EventTriggers::Stop);
+                if !self.shutdown_triggered {
+                    if !critical {
+                        debug!("Attempting Shutdown..");
+                        let _ = self.global_tx.try_send(EventTriggers::Stop(false));
+                    } else {
+                        // If we receive an ENDSESSION_CRITICAL we should avoid writing to the
+                        // disk at all cost as we are no longer in control of when we exit.
+                        debug!("Critical Shutdown Received, safely shutting down..");
+                        let _ = self.global_tx.try_send(EventTriggers::Stop(true));
+                    }
+                    self.shutdown_triggered = true;
+                } else {
+                    debug!("Shutdown Already Triggered, going straight to hell..");
+                }
 
                 // Now wait for the daemon to actually stop..
                 loop {
                     if self.state.shutdown_blocking.load(Ordering::Relaxed) {
                         unsafe {
-                            ShutdownBlockReasonDestroy(hwnd);
+                            let _ = ShutdownBlockReasonDestroy(hwnd);
                         }
                         break;
                     } else {
@@ -313,10 +453,63 @@ impl WindowProc for GoXLRWindowProc {
                     }
                 }
             }
-            winuser::WM_ENDSESSION => {
-                debug!("Received WM_ENDSESSION from Windows (IGNORED)");
+            WM_ENDSESSION => {
+                debug!("Received WM_ENDSESSION from Windows, Doing nothing..");
             }
-            _ => {}
+            WM_POWERBROADCAST => {
+                debug!("Received POWER Broadcast from Windows");
+                let param = wparam.0 as *const u32 as u32;
+                if param == PBT_APMSUSPEND {
+                    debug!("Suspend Requested by Windows, Handling..");
+                    let (tx, mut rx) = oneshot::channel();
+
+                    // Give a maximum of 1 second for a response..
+                    let milli_wait = 5;
+                    let max_wait = 1000 / milli_wait;
+                    let mut count = 0;
+
+                    // Only hold on the receiver if the send was successful..
+                    if self.global_tx.try_send(EventTriggers::Sleep(tx)).is_ok() {
+                        debug!("Awaiting Sleep Response..");
+                        while rx.try_recv().is_err() {
+                            sleep(Duration::from_millis(milli_wait));
+                            count += 1;
+                            if count > max_wait {
+                                debug!("Timeout Exceeded, bailing.");
+                                break;
+                            }
+                        }
+                        debug!("Task Completed, allowing Windows to Sleep");
+                    }
+                }
+                if param == PBT_APMRESUMESUSPEND {
+                    debug!("Wake Signal Received..");
+                    let (tx, _rx) = oneshot::channel();
+
+                    // We're awake again, we don't need to care about the response here.
+                    let _ = self.global_tx.try_send(EventTriggers::Wake(tx));
+                }
+            }
+            WM_WTSSESSION_CHANGE => {
+                let id = wparam.0 as *const u32 as u32;
+                match id {
+                    WTS_SESSION_LOCK => {
+                        let _ = self.global_tx.try_send(EventTriggers::Lock);
+                    }
+                    WTS_SESSION_UNLOCK => {
+                        let _ = self.global_tx.try_send(EventTriggers::Unlock);
+                    }
+                    _ => {
+                        debug!("Received Unknown Session Event ID: {}", id)
+                    }
+                }
+            }
+            _ => {
+                if msg == *RESPAWN {
+                    debug!("Icon respawn requested: {}", msg);
+                    self.create_icon(hwnd);
+                }
+            }
         }
         None
     }
@@ -332,22 +525,65 @@ fn tooltip(msg: &str) -> [u16; 128] {
     }
     array
 }
-fn get_notification_struct(hwnd: &HWND) -> NOTIFYICONDATAW {
+fn get_notification_struct(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as DWORD,
-        hWnd: *hwnd,
+        hWnd: hwnd,
         uID: 1,
-        uFlags: 0,
+        uFlags: NOTIFY_ICON_DATA_FLAGS(0),
         uCallbackMessage: 0,
-        hIcon: 0 as HICON,
-        szTip: [0; 128],
-        dwState: 0,
-        dwStateMask: 0,
-        szInfo: [0; 256],
-        u: Default::default(),
-        szInfoTitle: [0; 64],
-        dwInfoFlags: 0,
-        guidItem: GUID::default(),
-        hBalloonIcon: 0 as HICON,
+        ..Default::default()
     }
+}
+
+pub fn get_icon_from_global() -> (Vec<u8>, u32, u32) {
+    let image = image::load_from_memory(crate::ICON)
+        .expect("Failed to load Icon")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    (rgba, width, height)
+}
+
+unsafe extern "system" fn raw_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        let create_struct = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+        let window_pointer = create_struct.lpCreateParams;
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, window_pointer as isize) };
+    }
+
+    let window_pointer =
+        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Box<dyn WindowProc> };
+    let result = {
+        if window_pointer.is_null() {
+            None
+        } else {
+            let reference = unsafe { Rc::from_raw(window_pointer) };
+            mem::forget(reference.clone());
+            unsafe { (*window_pointer).window_proc(hwnd, msg, wparam, lparam) }
+        }
+    };
+
+    if msg == WM_NCDESTROY && !window_pointer.is_null() {
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Rc::from_raw(window_pointer))
+        };
+    }
+    result.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
+}
+
+// This is our trait, so we can build a struct and call into it..
+trait WindowProc {
+    fn window_proc(
+        &mut self,
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<LRESULT>;
 }

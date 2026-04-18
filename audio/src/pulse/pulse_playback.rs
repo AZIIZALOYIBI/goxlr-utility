@@ -1,5 +1,5 @@
-use crate::audio::{AudioOutput, AudioSpecification};
-use anyhow::{anyhow, Result};
+use crate::audio::{AudioOutput, AudioSpecification, OpenOutputStream};
+use anyhow::{Result, anyhow};
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
@@ -11,8 +11,8 @@ pub struct PulsePlayback {
     pulse_simple: Simple,
 }
 
-impl PulsePlayback {
-    pub fn open(spec: AudioSpecification) -> Result<Box<dyn AudioOutput>> {
+impl OpenOutputStream for PulsePlayback {
+    fn open(spec: AudioSpecification) -> Result<Box<dyn AudioOutput>> {
         let pulse_spec = Spec {
             format: Format::FLOAT32NE,
             channels: spec.spec.channels.count() as u8,
@@ -72,7 +72,7 @@ impl AudioOutput for PulsePlayback {
             buffer.extend_from_slice(&sample.to_le_bytes());
         }
 
-        if self.pulse_simple.write(buffer.as_slice()).is_ok() {}
+        let _ = self.pulse_simple.write(buffer.as_slice());
         Ok(())
     }
 

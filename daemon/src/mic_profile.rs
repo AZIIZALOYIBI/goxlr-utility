@@ -1,6 +1,6 @@
 use crate::files::can_create_new_file;
 use crate::profile::ProfileAdapter;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
 use enum_map::EnumMap;
 use goxlr_ipc::{Compressor, Equaliser, EqualiserMini, NoiseGate};
@@ -13,7 +13,7 @@ use goxlr_types::{
 use log::warn;
 use ritelinked::LinkedHashSet;
 use std::collections::{HashMap, HashSet};
-use std::fs::{remove_file, File};
+use std::fs::{File, remove_file};
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use strum::IntoEnumIterator;
@@ -33,17 +33,6 @@ pub struct MicProfileAdapter {
 }
 
 impl MicProfileAdapter {
-    pub fn from_named_or_default(name: String, directory: &Path) -> Self {
-        match MicProfileAdapter::from_named(name.clone(), directory) {
-            Ok(result) => result,
-            Err(error) => {
-                warn!("Couldn't load mic profile {}: {}", name, error);
-                warn!("Loading Embedded Default Profile");
-                MicProfileAdapter::default()
-            }
-        }
-    }
-
     pub fn from_named(name: String, directory: &Path) -> Result<Self> {
         let path = directory.join(format!("{name}.goxlrMicProfile"));
         if path.is_file() {
@@ -1121,7 +1110,7 @@ impl MicProfileAdapter {
         keys
     }
 
-    pub fn get_fx_keys(&self) -> LinkedHashSet<EffectKey> {
+    pub fn get_fx_keys(&self, use_echo_tempo: bool) -> LinkedHashSet<EffectKey> {
         let mut keys = LinkedHashSet::new();
 
         // We can't iterate over EffectKey, simply because they are ordered by their GoXLR
@@ -1131,9 +1120,13 @@ impl MicProfileAdapter {
         keys.extend(self.get_megaphone_keyset());
         keys.extend(self.get_robot_keyset());
         keys.extend(self.get_hardtune_keyset());
-        keys.extend(self.get_echo_keyset());
+        keys.extend(self.get_echo_keyset(use_echo_tempo));
         keys.extend(self.get_pitch_keyset());
         keys.extend(self.get_gender_keyset());
+        keys.extend(self.get_enabled_keyset());
+
+        // Make sure the Mic Mute State key is handled..
+        keys.insert(EffectKey::MicInputMute);
 
         keys
     }
@@ -1157,7 +1150,7 @@ impl MicProfileAdapter {
         set
     }
 
-    pub fn get_echo_keyset(&self) -> LinkedHashSet<EffectKey> {
+    pub fn get_echo_keyset(&self, use_echo_tempo: bool) -> LinkedHashSet<EffectKey> {
         let mut set = LinkedHashSet::new();
         set.insert(EffectKey::EchoAmount);
         set.insert(EffectKey::EchoSource);
@@ -1169,9 +1162,14 @@ impl MicProfileAdapter {
         set.insert(EffectKey::EchoXFBRtoL);
         set.insert(EffectKey::EchoFeedback);
         set.insert(EffectKey::EchoFilterStyle);
-        set.insert(EffectKey::EchoTempo);
-        set.insert(EffectKey::EchoDelayL);
-        set.insert(EffectKey::EchoDelayR);
+
+        // The keys we add for Echo are dependent on the settings..
+        if use_echo_tempo {
+            set.insert(EffectKey::EchoTempo);
+        } else {
+            set.insert(EffectKey::EchoDelayL);
+            set.insert(EffectKey::EchoDelayR);
+        }
 
         set
     }
@@ -1194,7 +1192,6 @@ impl MicProfileAdapter {
 
     pub fn get_megaphone_keyset(&self) -> LinkedHashSet<EffectKey> {
         let mut set = LinkedHashSet::new();
-        set.insert(EffectKey::MegaphoneEnabled);
         set.insert(EffectKey::MegaphoneStyle);
         set.insert(EffectKey::MegaphoneAmount);
         set.insert(EffectKey::MegaphoneHP);
@@ -1216,7 +1213,6 @@ impl MicProfileAdapter {
 
     pub fn get_robot_keyset(&self) -> LinkedHashSet<EffectKey> {
         let mut set = LinkedHashSet::new();
-        set.insert(EffectKey::RobotEnabled);
         set.insert(EffectKey::RobotPulseWidth);
         set.insert(EffectKey::RobotWaveform);
         set.insert(EffectKey::RobotThreshold);
@@ -1237,13 +1233,26 @@ impl MicProfileAdapter {
 
     pub fn get_hardtune_keyset(&self) -> LinkedHashSet<EffectKey> {
         let mut set = LinkedHashSet::new();
-        set.insert(EffectKey::HardTuneEnabled);
         set.insert(EffectKey::HardTuneKeySource);
         set.insert(EffectKey::HardTuneAmount);
         set.insert(EffectKey::HardTuneWindow);
         set.insert(EffectKey::HardTuneRate);
         set.insert(EffectKey::HardTuneScale);
         set.insert(EffectKey::HardTunePitchAmount);
+
+        set
+    }
+
+    pub fn get_enabled_keyset(&self) -> LinkedHashSet<EffectKey> {
+        let mut set = LinkedHashSet::new();
+        set.insert(EffectKey::Encoder1Enabled);
+        set.insert(EffectKey::Encoder2Enabled);
+        set.insert(EffectKey::Encoder3Enabled);
+        set.insert(EffectKey::Encoder4Enabled);
+
+        set.insert(EffectKey::MegaphoneEnabled);
+        set.insert(EffectKey::HardTuneEnabled);
+        set.insert(EffectKey::RobotEnabled);
 
         set
     }

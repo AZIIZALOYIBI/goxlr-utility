@@ -1,46 +1,57 @@
-mod cli;
-mod microphone;
-
 use crate::cli::{
     AnimationCommands, ButtonGroupLightingCommands, ButtonLightingCommands, CompressorCommands,
     CoughButtonBehaviours, Echo, EffectsCommands, EqualiserCommands, EqualiserMiniCommands,
-    FaderCommands, FaderLightingCommands, FadersAllLightingCommands, Gender, HardTune,
-    LightingCommands, Megaphone, MicrophoneCommands, NoiseGateCommands, Pitch, ProfileAction,
-    ProfileType, Reverb, Robot, SamplerCommands, Scribbles, SubCommands, SubmixCommands,
+    FaderCommands, FaderLightingCommands, FadersAllLightingCommands, FirmwareCommands, Gender,
+    HardTune, LightingCommands, Megaphone, MicrophoneCommands, NoiseGateCommands, Pitch,
+    ProfileAction, ProfileType, Reverb, Robot, SamplerCommands, Scribbles, SubCommands,
+    SubmixCommands,
 };
+use crate::cli::{Cli, DeviceSettings};
 use crate::microphone::apply_microphone_controls;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use cli::Cli;
+use goxlr_ipc::GoXLRCommand;
 use goxlr_ipc::client::Client;
 use goxlr_ipc::clients::ipc::ipc_client::IPCClient;
 use goxlr_ipc::clients::ipc::ipc_socket::Socket;
 use goxlr_ipc::clients::web::web_client::WebClient;
-use goxlr_ipc::GoXLRCommand;
 use goxlr_ipc::{DaemonRequest, DaemonResponse, MixerStatus, UsbProductInformation};
 use goxlr_types::{ChannelName, DeviceType, FaderName, InputDevice, MicrophoneType, OutputDevice};
-use interprocess::local_socket::tokio::LocalSocketStream;
-use interprocess::local_socket::NameTypeSupport;
+
+use interprocess::local_socket::tokio::prelude::LocalSocketStream;
+use interprocess::local_socket::traits::tokio::Stream;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use strum::IntoEnumIterator;
 
 static SOCKET_PATH: &str = "/tmp/goxlr.socket";
 static NAMED_PIPE: &str = "@goxlr.socket";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run_cli() -> Result<()> {
     let cli: Cli = Cli::parse();
 
     let mut client: Box<dyn Client>;
 
     if let Some(url) = cli.use_http {
-        client = Box::new(WebClient::new(format!("{}/api/command", url)));
+        client = Box::new(WebClient::new(format!("{url}/api/command")));
     } else {
-        let connection = LocalSocketStream::connect(match NameTypeSupport::query() {
-            NameTypeSupport::OnlyPaths | NameTypeSupport::Both => SOCKET_PATH,
-            NameTypeSupport::OnlyNamespaced => NAMED_PIPE,
-        })
-        .await
-        .context("Unable to connect to the GoXLR daemon Process")?;
+        // Windows supports unix sockets now, but we want to maintain the historic behaviour
+        // so we'll force it to a NameSpace here..
+        let path = if cfg!(windows) {
+            NAMED_PIPE.to_ns_name::<GenericNamespaced>()
+        } else {
+            SOCKET_PATH.to_fs_name::<GenericFilePath>()
+        };
+
+        let path = match path {
+            Ok(path) => path,
+            Err(e) => {
+                bail!("Unable to Process Path {}", e);
+            }
+        };
+
+        let connection = LocalSocketStream::connect(path)
+            .await
+            .context("Unable to connect to the GoXLR daemon Process")?;
 
         let socket: Socket<DaemonResponse, DaemonRequest> = Socket::new(connection);
         client = Box::new(IPCClient::new(socket));
@@ -76,12 +87,6 @@ async fn main() -> Result<()> {
     apply_microphone_controls(&cli.microphone_controls, &mut client, &serial)
         .await
         .context("Could not apply microphone controls")?;
-
-    // These will be moved around later :)
-    match &cli.subcommands {
-        None => {}
-        Some(_) => {}
-    }
 
     match &cli.subcommands {
         None => {}
@@ -451,11 +456,17 @@ async fn main() -> Result<()> {
                                 .await
                                 .context("Unable to create new profile")?;
                         }
-                        ProfileAction::Load { profile_name } => {
+                        ProfileAction::Load {
+                            profile_name,
+                            persist,
+                        } => {
                             client
                                 .command(
                                     &serial,
-                                    GoXLRCommand::LoadProfile(profile_name.to_string(), true),
+                                    GoXLRCommand::LoadProfile(
+                                        profile_name.to_string(),
+                                        persist.unwrap_or(true),
+                                    ),
                                 )
                                 .await
                                 .context("Unable to Load Profile")?;
@@ -469,7 +480,7 @@ async fn main() -> Result<()> {
                                 .await
                                 .context("Unable to load Profile Colours")?;
                         }
-                        ProfileAction::Save {} => {
+                        ProfileAction::Save => {
                             client
                                 .command(&serial, GoXLRCommand::SaveProfile())
                                 .await
@@ -495,11 +506,17 @@ async fn main() -> Result<()> {
                                 .await
                                 .context("Unable to create new profile")?;
                         }
-                        ProfileAction::Load { profile_name } => {
+                        ProfileAction::Load {
+                            profile_name,
+                            persist,
+                        } => {
                             client
                                 .command(
                                     &serial,
-                                    GoXLRCommand::LoadMicProfile(profile_name.to_string(), true),
+                                    GoXLRCommand::LoadMicProfile(
+                                        profile_name.to_string(),
+                                        persist.unwrap_or(true),
+                                    ),
                                 )
                                 .await
                                 .context("Unable to Load Microphone Profile")?;
@@ -507,7 +524,7 @@ async fn main() -> Result<()> {
                         ProfileAction::LoadColours { .. } => {
                             return Err(anyhow!("Not supported for Microphone"));
                         }
-                        ProfileAction::Save {} => {
+                        ProfileAction::Save => {
                             client
                                 .command(&serial, GoXLRCommand::SaveMicProfile())
                                 .await
@@ -973,6 +990,59 @@ async fn main() -> Result<()> {
                     SubmixCommands::MonitorMix { device } => {
                         client
                             .command(&serial, GoXLRCommand::SetMonitorMix(*device))
+                            .await?;
+                    }
+                },
+                SubCommands::Settings { command } => match command {
+                    DeviceSettings::MuteHoldDuration { duration } => {
+                        client
+                            .command(&serial, GoXLRCommand::SetMuteHoldDuration(*duration))
+                            .await?;
+                    }
+                    DeviceSettings::SamplePreRecordBuffer { duration } => {
+                        client
+                            .command(
+                                &serial,
+                                GoXLRCommand::SetSamplerPreBufferDuration(*duration),
+                            )
+                            .await?;
+                    }
+                    DeviceSettings::MonitorWithFx { enabled } => {
+                        client
+                            .command(&serial, GoXLRCommand::SetMonitorWithFx(*enabled))
+                            .await?;
+                    }
+                    DeviceSettings::DeafenOnChatMute { enabled } => {
+                        client
+                            .command(&serial, GoXLRCommand::SetVCMuteAlsoMuteCM(*enabled))
+                            .await?;
+                    }
+                    DeviceSettings::LockFaders { enabled } => {
+                        client
+                            .command(&serial, GoXLRCommand::SetLockFaders(*enabled))
+                            .await?;
+                    }
+                },
+                SubCommands::Firmware { command } => match command {
+                    FirmwareCommands::FirmwareUpdate { path } => {
+                        client
+                            .daemon_command(DaemonRequest::RunFirmwareUpdate(
+                                serial.to_string(),
+                                path.clone(),
+                                false,
+                            ))
+                            .await?;
+                    }
+                    FirmwareCommands::ContinueFirmwareUpdate => {
+                        client
+                            .daemon_command(DaemonRequest::ContinueFirmwareUpdate(
+                                serial.to_string(),
+                            ))
+                            .await?;
+                    }
+                    FirmwareCommands::ClearFirmwareUpdate => {
+                        client
+                            .daemon_command(DaemonRequest::ClearFirmwareState(serial.to_string()))
                             .await?;
                     }
                 },

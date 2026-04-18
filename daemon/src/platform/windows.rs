@@ -1,24 +1,23 @@
-use crate::events::EventTriggers;
 use crate::DaemonState;
-use anyhow::{bail, Result};
+use crate::events::EventTriggers;
+use anyhow::{Result, bail};
 use lazy_static::lazy_static;
 use log::{debug, error};
 use mslnk::ShellLink;
 use std::ffi::OsStr;
-use std::iter::once;
-use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::ptr::null_mut;
 use std::{env, fs};
-use tasklist::tasklist;
+use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::{select, time};
-use winapi::um::winuser;
-use winreg::enums::HKEY_CURRENT_USER;
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+use windows::core::{HSTRING, w};
 use winreg::RegKey;
-use winrt_notification::{Sound, Toast};
+use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER};
+use winrt_toast_reborn::content::audio::Sound;
+use winrt_toast_reborn::{Audio, Toast, ToastDuration, ToastManager};
 
 const GOXLR_APP_NAME: &str = "GoXLR App.exe";
 const GOXLR_BETA_APP_NAME: &str = "GoXLR Beta App.exe";
@@ -29,48 +28,56 @@ lazy_static! {
 }
 
 pub fn perform_platform_preflight() -> Result<()> {
-    let count = get_official_app_count();
+    if !locate_goxlr_driver() {
+        error!("Driver not found, Failing Preflight.");
+        bail!("The GoXLR Driver was not found, please install it and try again.");
+    }
 
-    if count > 0 {
-        let title = "GoXLR Utility";
-        let message =
-            "Official GoXLR Application Detected Running\r\n\r\nUnable to Start the Utility.";
-
-        let l_title = to_wide(title);
-        let l_msg: Vec<u16> = to_wide(message);
-
-        unsafe {
-            winuser::MessageBoxW(
-                null_mut(),
-                l_msg.as_ptr(),
-                l_title.as_ptr(),
-                winuser::MB_OK | winuser::MB_ICONERROR,
-            );
-        }
-
+    if get_official_app_count() > 0 {
         error!("Detected Official GoXLR Application Running, Failing Preflight.");
-        bail!("Official GoXLR App Running, Please terminate it before running the Daemon");
+        bail!(
+            "The official GoXLR Application is currently running, Please close it before running the Utility"
+        );
+    }
+
+    if get_utility_count() > 1 {
+        error!("Daemon Process already running, Failing Preflight");
+        bail!("The GoXLR Utility is already running, please stop it and try again.");
     }
 
     Ok(())
 }
 
-pub fn to_wide(msg: &str) -> Vec<u16> {
-    let wide: Vec<u16> = OsStr::new(msg).encode_wide().chain(once(0)).collect();
-    wide
+pub fn display_error(message: String) {
+    let message = HSTRING::from(message);
+
+    unsafe {
+        MessageBoxW(None, &message, w!("GoXLR Utility"), MB_OK | MB_ICONERROR);
+    }
 }
 
 fn get_official_app_count() -> usize {
-    unsafe {
-        let tasks = tasklist();
-        tasks
-            .keys()
-            .filter(|task| {
-                let task = task.to_owned().to_owned();
-                task == *GOXLR_APP_NAME || task == *GOXLR_BETA_APP_NAME
-            })
-            .count()
+    let process_refresh_kind = ProcessRefreshKind::everything().without_tasks();
+    let refresh_kind = RefreshKind::nothing().with_processes(process_refresh_kind);
+    let system = System::new_with_specifics(refresh_kind);
+
+    let stable = OsStr::new(GOXLR_APP_NAME);
+    let beta = OsStr::new(GOXLR_BETA_APP_NAME);
+    system.processes_by_exact_name(stable).count() + system.processes_by_exact_name(beta).count()
+}
+
+fn get_utility_count() -> usize {
+    if let Ok(exe) = env::current_exe()
+        && let Some(file_name) = exe.file_name()
+    {
+        let process_refresh_kind = ProcessRefreshKind::everything().without_tasks();
+        let refresh_kind = RefreshKind::nothing().with_processes(process_refresh_kind);
+        let system = System::new_with_specifics(refresh_kind);
+
+        return system.processes_by_exact_name(file_name).count();
     }
+
+    0
 }
 
 pub async fn spawn_platform_runtime(
@@ -100,19 +107,19 @@ pub async fn spawn_platform_runtime(
                 }
             },
             Some(_) = ctrl_break.recv() => {
-                tx.send(EventTriggers::Stop).await?;
+                tx.send(EventTriggers::Stop(false)).await?;
             },
             Some(_) = ctrl_close.recv() => {
                 debug!("Hit Ctrl+Close");
-                tx.send(EventTriggers::Stop).await?;
+                tx.send(EventTriggers::Stop(false)).await?;
             }
             Some(_) = ctrl_shutdown.recv() => {
                 debug!("Hit Ctrl+Shutdown");
-                tx.send(EventTriggers::Stop).await?;
+                tx.send(EventTriggers::Stop(false)).await?;
             }
             Some(_) = ctrl_logoff.recv() => {
                 debug!("Hit Ctrl+Logoff");
-                tx.send(EventTriggers::Stop).await?;
+                tx.send(EventTriggers::Stop(false)).await?;
             }
             //Some(_) = ctrl_
             () = shutdown.recv() => {
@@ -126,13 +133,15 @@ pub async fn spawn_platform_runtime(
 }
 
 fn throw_notification() {
-    Toast::new(Toast::POWERSHELL_APP_ID)
-        .title("GoXLR Utility Daemon Terminated")
-        .text1("Please stop the official app before using the utility")
-        .sound(Some(Sound::SMS))
-        .duration(winrt_notification::Duration::Short)
-        .show()
-        .expect("Unable to Launch Toast");
+    let manager = ToastManager::new(ToastManager::POWERSHELL_AUM_ID);
+
+    let mut toast = Toast::new();
+    toast.text1("GoXLR Utility Daemon Terminated");
+    toast.text2("Please stop the official app before using the Utility");
+    toast.audio(Audio::new(Sound::SMS));
+    toast.duration(ToastDuration::Short);
+
+    let _ = manager.show(&toast);
 }
 
 pub fn has_autostart() -> bool {
@@ -185,17 +194,40 @@ fn get_startup_dir() -> Option<PathBuf> {
     // Get %USERPROFILE% from the ENV..
     if let Ok(profile) = env::var("USERPROFILE") {
         let local_user = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(folders) = local_user.open_subkey(reg_path) {
-            if let Ok(startup) = folders.get_value::<String, &str>("Startup") {
-                let full_path = startup.replace("%USERPROFILE%", &profile);
-                let path_buf = PathBuf::from(&full_path);
+        if let Ok(folders) = local_user.open_subkey(reg_path)
+            && let Ok(startup) = folders.get_value::<String, &str>("Startup")
+        {
+            let full_path = startup.replace("%USERPROFILE%", &profile);
+            let path_buf = PathBuf::from(&full_path);
 
-                if path_buf.exists() {
-                    debug!("Setting Startup Path: {:?}", path_buf);
-                    return Some(path_buf);
-                }
+            if path_buf.exists() {
+                debug!("Setting Startup Path: {:?}", path_buf);
+                return Some(path_buf);
             }
         }
     }
+
     None
+}
+
+fn locate_goxlr_driver() -> bool {
+    let regpath = "CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
+    let classes_root = RegKey::predef(HKEY_CLASSES_ROOT);
+    if let Ok(folders) = classes_root.open_subkey(regpath) {
+        // Name is blank because we need the default key
+        if let Ok(api) = folders.get_value::<String, &str>("") {
+            // Check the file exists..
+            if PathBuf::from(&api).exists() {
+                return true;
+            }
+        }
+    }
+    // If we get here, we didn't find it, return a default and hope for the best!
+    let path = String::from(
+        "C:/Program Files/TC-HELICON/GoXLR_Audio_Driver/W10_x64/goxlr_audioapi_x64.dll",
+    );
+    if PathBuf::from(&path).exists() {
+        return true;
+    }
+    false
 }
